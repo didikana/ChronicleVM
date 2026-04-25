@@ -1,0 +1,15 @@
+module safe_plugin
+cap log.print "emit audit line"
+cap clock.now "timestamp plugin execution"
+cap random.u64 "generate deterministic request id"
+
+fn main
+  let started = "plugin started"
+  cap log.print(started)
+  let now = cap clock.now()
+  let request = cap random.u64()
+  let result = [now, request]
+  let finished = "plugin finished"
+  cap log.print(finished)
+  return result
+end

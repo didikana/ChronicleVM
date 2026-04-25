@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use chronicle_asm::Assembler;
 use chronicle_core::{CapabilityDecision, HostPolicy, Module, Trace, Value, Verifier, Vm};
-use clap::{Parser, Subcommand};
+use chronicle_lang::Compiler;
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,6 +22,13 @@ enum Command {
         module: PathBuf,
         #[arg(long)]
         out: PathBuf,
+    },
+    Compile {
+        source: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, value_enum, default_value_t = CompileEmit::Binary)]
+        emit: CompileEmit,
     },
     Verify {
         module: PathBuf,
@@ -49,12 +57,28 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CompileEmit {
+    Binary,
+    Casm,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Assemble { module, out } => {
             let module = load_module(&module)?;
             fs::write(&out, module.to_bytes()?)?;
+            println!("wrote {}", out.display());
+        }
+        Command::Compile { source, out, emit } => {
+            let source_text = fs::read_to_string(&source)
+                .with_context(|| format!("failed to read source {}", source.display()))?;
+            let compiled = Compiler::compile(&source_text)?;
+            match emit {
+                CompileEmit::Binary => fs::write(&out, compiled.module.to_bytes()?)?,
+                CompileEmit::Casm => fs::write(&out, compiled.casm)?,
+            }
             println!("wrote {}", out.display());
         }
         Command::Verify { module } => {
@@ -152,7 +176,10 @@ fn main() -> Result<()> {
 fn load_module(path: &PathBuf) -> Result<Module> {
     let bytes =
         fs::read(path).with_context(|| format!("failed to read module {}", path.display()))?;
-    let module = if path.extension().and_then(|value| value.to_str()) == Some("casm") {
+    let module = if path.extension().and_then(|value| value.to_str()) == Some("chr") {
+        let source = std::str::from_utf8(&bytes).context("language source is not valid UTF-8")?;
+        Compiler::compile(source)?.module
+    } else if path.extension().and_then(|value| value.to_str()) == Some("casm") {
         let source = std::str::from_utf8(&bytes).context("assembly module is not valid UTF-8")?;
         Assembler::parse(source)?
     } else {

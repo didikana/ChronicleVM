@@ -73,6 +73,7 @@ dependencies = [
  "anyhow",
  "chronicle-asm",
  "chronicle-core",
+ "chronicle-lang",
  "clap",
  "serde",
  "serde_json",
@@ -85,6 +86,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "chronicle-lang"
+version = "0.1.0"
+dependencies = [
+ "chronicle-core",
  "thiserror",
 ]
 

@@ -10,6 +10,7 @@ connect VM events back to source instructions.
 
 - `chronicle-core`: bytecode model, verifier, runtime, capabilities, trace replay.
 - `chronicle-asm`: text assembly parser for `.casm` modules.
+- `chronicle-lang`: high-level `.chr` language compiler.
 - `chronicle-cli`: `chronicle` command line runner.
 
 ## Try It
@@ -21,7 +22,10 @@ cargo run -p chronicle-cli -- inspect /tmp/run.ctrace
 cargo run -p chronicle-cli -- replay /tmp/run.ctrace
 cargo run -p chronicle-cli -- verify examples/plugin.casm
 cargo run -p chronicle-cli -- assemble examples/plugin.casm --out /tmp/plugin.cmod
+cargo run -p chronicle-cli -- compile examples/plugin.chr --emit casm --out /tmp/plugin.casm
+cargo run -p chronicle-cli -- compile examples/plugin.chr --out /tmp/plugin.cmod
 cargo run -p chronicle-cli -- run examples/plugin.casm --policy examples/plugin-mock.toml
+cargo run -p chronicle-cli -- run examples/plugin.chr --policy examples/plugin-mock.toml
 ```
 
 ## Assembly Sketch
@@ -55,11 +59,32 @@ Any undeclared or unlisted capability is denied by default.
 
 `chronicle assemble` writes Chronicle binary modules with a `CHVMOD1` header.
 The CLI can run or verify `.casm` source modules, binary modules such as
-`.cmod`, and legacy JSON module files.
+`.cmod`, high-level `.chr` source modules, and legacy JSON module files.
+
+## Chronicle Language Sketch
+
+`.chr` files are a compact high-level source format that compiles to `.casm` or
+binary bytecode:
+
+```text
+module safe_plugin
+cap log.print "emit audit line"
+
+fn main
+  let started = "plugin started"
+  cap log.print(started)
+  let result = [1, 2]
+  return result
+end
+```
+
+Supported v1 expressions are literals, variables, arrays, arithmetic/comparison
+with spaced operators such as `a + b`, and capability calls like
+`cap clock.now()`.
 
 ## Safe Plugin Demo
 
-`examples/plugin.casm` declares three capabilities. Run it with
+`examples/plugin.chr` and `examples/plugin.casm` declare three capabilities. Run them with
 `plugin-mock.toml` for deterministic host values, `plugin-grant.toml` for live
 host values, or `plugin-deny.toml` to see capability negotiation fail before
 execution.
