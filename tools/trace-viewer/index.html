@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chronicle Trace Viewer</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">ChronicleVM</p>
+          <h1>Trace Viewer</h1>
+        </div>
+        <div class="actions">
+          <label class="file-button">
+            <input id="fileInput" type="file" accept=".ctrace,application/json" />
+            Open trace
+          </label>
+          <button id="loadSample" type="button">Load sample</button>
+        </div>
+      </header>
+
+      <section id="dropzone" class="dropzone" aria-label="Trace file drop zone">
+        <div>
+          <strong>Drop a .ctrace file here</strong>
+          <span>or open one from disk. The viewer stays local in your browser.</span>
+        </div>
+      </section>
+
+      <section class="summary-grid" aria-label="Trace summary">
+        <article>
+          <span>Module</span>
+          <strong id="moduleName">-</strong>
+        </article>
+        <article>
+          <span>Entry</span>
+          <strong id="entryName">-</strong>
+        </article>
+        <article>
+          <span>Events</span>
+          <strong id="eventCount">0</strong>
+        </article>
+        <article>
+          <span>Checksum</span>
+          <strong id="traceChecksum">-</strong>
+        </article>
+      </section>
+
+      <section class="workspace">
+        <aside class="timeline-panel" aria-label="Trace timeline">
+          <div class="panel-heading">
+            <h2>Timeline</h2>
+            <div class="step-controls">
+              <button id="prevEvent" type="button" aria-label="Previous event">Prev</button>
+              <button id="nextEvent" type="button" aria-label="Next event">Next</button>
+            </div>
+          </div>
+          <label class="search">
+            <span>Filter</span>
+            <input id="filterInput" type="search" placeholder="opcode, capability, line..." />
+          </label>
+          <ol id="timeline" class="timeline"></ol>
+        </aside>
+
+        <section class="detail-panel" aria-label="Selected event details">
+          <div class="event-title">
+            <div>
+              <p id="eventPosition" class="eyebrow">No event selected</p>
+              <h2 id="eventOpcode">Open a trace</h2>
+            </div>
+            <span id="eventChecksum" class="checksum">-</span>
+          </div>
+
+          <div class="detail-grid">
+            <article class="source-card">
+              <h3>Source</h3>
+              <dl>
+                <div><dt>Function</dt><dd id="eventFunction">-</dd></div>
+                <div><dt>PC</dt><dd id="eventPc">-</dd></div>
+                <div><dt>Line</dt><dd id="eventLine">-</dd></div>
+              </dl>
+            </article>
+
+            <article class="cap-card">
+              <h3>Capability</h3>
+              <div id="capabilityDetail" class="empty-state">No capability call on this event.</div>
+            </article>
+          </div>
+
+          <div class="tabs" role="tablist" aria-label="Detail views">
+            <button class="tab active" data-tab="registers" type="button">Registers</button>
+            <button class="tab" data-tab="audit" type="button">Capability Audit</button>
+            <button class="tab" data-tab="raw" type="button">Raw Event</button>
+          </div>
+
+          <section id="registersTab" class="tab-panel active">
+            <h3>Register Changes</h3>
+            <div id="registerChanges" class="kv-list"></div>
+          </section>
+
+          <section id="auditTab" class="tab-panel">
+            <h3>Capability Calls</h3>
+            <div id="capabilityAudit" class="audit-list"></div>
+          </section>
+
+          <section id="rawTab" class="tab-panel">
+            <h3>Raw Event</h3>
+            <pre id="rawEvent">{}</pre>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js?v=2"></script>
+  </body>
+</html>

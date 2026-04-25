@@ -115,6 +115,17 @@ The interactive debugger supports `next`, `prev`, `jump N`, `regs`, `caps`,
 chronicle debug /tmp/plugin.ctrace --commands "source;next;regs;caps;quit"
 ```
 
+## Web Trace Viewer
+
+Open `tools/trace-viewer/index.html` in a browser, or serve it locally:
+
+```sh
+python3 -m http.server 4173 --directory tools/trace-viewer
+```
+
+Then visit `http://localhost:4173` and drop a `.ctrace` file into the viewer.
+The page also includes a built-in sample trace for quick demos.
+
 ## Safe Plugin Demo
 
 `examples/plugin.chr` and `examples/plugin.casm` declare three capabilities. Run them with

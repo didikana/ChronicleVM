@@ -34,6 +34,13 @@ event stream. It never re-executes the VM; it reconstructs register state from
 recorded register changes and lets the user step through the trace with
 `next`, `prev`, `jump N`, `regs`, `caps`, `event`, and `source`.
 
+## Web Viewer
+
+`tools/trace-viewer/index.html` is a static browser viewer for `.ctrace` files.
+It supports drag/drop trace loading, timeline filtering, event selection,
+register diffs, capability audit summaries, and raw event inspection. The viewer
+runs entirely client-side.
+
 ## Determinism
 
 - Mocked capabilities are deterministic by policy.
