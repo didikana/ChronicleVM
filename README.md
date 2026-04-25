@@ -17,6 +17,9 @@ cargo run -p chronicle-cli -- run examples/hello.casm --policy examples/policy.t
 cargo run -p chronicle-cli -- trace examples/clock.casm --policy examples/policy.toml --out /tmp/run.ctrace
 cargo run -p chronicle-cli -- inspect /tmp/run.ctrace
 cargo run -p chronicle-cli -- replay /tmp/run.ctrace
+cargo run -p chronicle-cli -- verify examples/plugin.casm
+cargo run -p chronicle-cli -- assemble examples/plugin.casm --out /tmp/plugin.json
+cargo run -p chronicle-cli -- run examples/plugin.casm --policy examples/plugin-mock.toml
 ```
 
 ## Assembly Sketch
@@ -45,3 +48,10 @@ registers are `r0` through `rN-1`. For callable functions, add `arity=N`.
 ```
 
 Any undeclared or unlisted capability is denied by default.
+
+## Safe Plugin Demo
+
+`examples/plugin.casm` declares three capabilities. Run it with
+`plugin-mock.toml` for deterministic host values, `plugin-grant.toml` for live
+host values, or `plugin-deny.toml` to see capability negotiation fail before
+execution.

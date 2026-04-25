@@ -17,6 +17,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Assemble {
+        module: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    Verify {
+        module: PathBuf,
+    },
     Run {
         module: PathBuf,
         #[arg(long)]
@@ -44,6 +52,20 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Assemble { module, out } => {
+            let module = load_module(&module)?;
+            fs::write(&out, module.to_bytes()?)?;
+            println!("wrote {}", out.display());
+        }
+        Command::Verify { module } => {
+            let module = load_module(&module)?;
+            println!(
+                "verified module {}: {} functions, {} capabilities",
+                module.name,
+                module.functions.len(),
+                module.capabilities.len()
+            );
+        }
         Command::Run {
             module,
             policy,
@@ -109,6 +131,9 @@ fn main() -> Result<()> {
                         capability.name,
                         render_value(&capability.result)
                     );
+                }
+                for change in &event.register_changes {
+                    println!("  r{} = {}", change.register, render_value(&change.value));
                 }
                 if let Some(error) = &event.error {
                     println!("  error {error}");

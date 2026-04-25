@@ -1,0 +1,4 @@
+[capabilities]
+"log.print" = "grant"
+"clock.now" = { mock = 1800000000 }
+"random.u64" = { mock = 9001 }
