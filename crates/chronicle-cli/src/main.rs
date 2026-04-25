@@ -118,10 +118,15 @@ fn main() -> Result<()> {
                 println!("error: {error}");
             }
             for event in &trace.events {
+                let source = event
+                    .source_line
+                    .map(|line| format!(" line={line}"))
+                    .unwrap_or_default();
                 println!(
-                    "{} pc={} op={} changes={}",
+                    "{} pc={}{} op={} changes={}",
                     event.function,
                     event.pc,
+                    source,
                     event.opcode,
                     event.register_changes.len()
                 );

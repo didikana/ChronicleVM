@@ -80,6 +80,8 @@ pub struct Function {
     pub registers: usize,
     pub arity: usize,
     pub code: Vec<Instruction>,
+    #[serde(default)]
+    pub source_lines: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -147,6 +149,12 @@ impl Verifier {
             if function.arity > function.registers {
                 return Err(ChronicleError::Verify(format!(
                     "function {} arity exceeds register count",
+                    function.name
+                )));
+            }
+            if !function.source_lines.is_empty() && function.source_lines.len() != function.code.len() {
+                return Err(ChronicleError::Verify(format!(
+                    "function {} source line map length does not match code length",
                     function.name
                 )));
             }
@@ -299,6 +307,7 @@ pub struct Trace {
 pub struct TraceEvent {
     pub function: String,
     pub pc: usize,
+    pub source_line: Option<usize>,
     pub opcode: String,
     pub register_changes: Vec<RegisterChange>,
     pub capability: Option<CapabilityTrace>,
@@ -440,6 +449,7 @@ impl Vm {
             let mut event = TraceEvent {
                 function: function.name.clone(),
                 pc,
+                source_line: function.source_lines.get(pc).copied().flatten(),
                 opcode: instruction.opcode().to_string(),
                 register_changes: Vec::new(),
                 capability: None,
@@ -704,6 +714,7 @@ mod tests {
                 registers: 1,
                 arity: 0,
                 code: vec![Instruction::Const { dst: 2, constant: 0 }],
+                source_lines: vec![Some(1)],
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
         };
@@ -731,6 +742,7 @@ mod tests {
                     },
                     Instruction::Ret { src: 0 },
                 ],
+                source_lines: vec![Some(1), Some(2)],
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
         };
@@ -754,6 +766,7 @@ mod tests {
                 registers: 1,
                 arity: 0,
                 code: vec![Instruction::Ret { src: 0 }],
+                source_lines: vec![Some(1)],
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
         };
@@ -781,6 +794,7 @@ mod tests {
                     },
                     Instruction::Ret { src: 0 },
                 ],
+                source_lines: vec![Some(1), Some(2)],
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
         };
@@ -808,6 +822,7 @@ mod tests {
                     Instruction::Const { dst: 0, constant: 0 },
                     Instruction::Ret { src: 0 },
                 ],
+                source_lines: vec![Some(1), Some(2)],
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
         };

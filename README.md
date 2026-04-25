@@ -3,6 +3,8 @@
 Chronicle VM is a small Rust VM for safe plugins. Its v1 identity is a
 replayable sandbox: modules declare capabilities, a host policy negotiates what
 they receive, and execution can be traced and replayed deterministically.
+Traces preserve source line metadata from `.casm` modules, so inspection can
+connect VM events back to source instructions.
 
 ## Workspace
 

@@ -128,6 +128,7 @@ impl<'a> Parser<'a> {
 
     fn finish_function(&mut self, line_no: usize, builder: FunctionBuilder) -> Result<()> {
         let mut code = Vec::new();
+        let mut source_lines = Vec::new();
         let labels = builder.labels;
         for (source_line, pending) in builder.pending {
             let instruction = match pending {
@@ -142,6 +143,7 @@ impl<'a> Parser<'a> {
                 }
             };
             code.push(instruction);
+            source_lines.push(Some(source_line));
         }
         if code.is_empty() {
             return Err(err(line_no, "function has no instructions"));
@@ -151,6 +153,7 @@ impl<'a> Parser<'a> {
             registers: builder.registers,
             arity: builder.arity,
             code,
+            source_lines,
         });
         Ok(())
     }
