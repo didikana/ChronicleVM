@@ -56,6 +56,21 @@ fn trace_inspect_and_replay_work() {
     assert!(replay.status.success());
     let replay_stdout = String::from_utf8(replay.stdout).unwrap();
     assert!(replay_stdout.contains("replayed 8 events"));
+
+    let debug = chronicle()
+        .arg("debug")
+        .arg(&trace)
+        .arg("--commands")
+        .arg("source;next;regs;caps;jump 7;event;quit")
+        .output()
+        .unwrap();
+    assert!(debug.status.success());
+    let debug_stdout = String::from_utf8(debug.stdout).unwrap();
+    assert!(debug_stdout.contains("debugging module safe_plugin"));
+    assert!(debug_stdout.contains("[1/7]"));
+    assert!(debug_stdout.contains("registers:"));
+    assert!(debug_stdout.contains("log.print@1"));
+    assert!(debug_stdout.contains("pc=7"));
     let _ = std::fs::remove_file(trace);
 }
 

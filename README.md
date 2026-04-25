@@ -27,6 +27,7 @@ cargo run -p chronicle-cli -- run examples/hello.casm --policy examples/policy.t
 cargo run -p chronicle-cli -- trace examples/clock.casm --policy examples/policy.toml --out /tmp/run.ctrace
 cargo run -p chronicle-cli -- inspect /tmp/run.ctrace
 cargo run -p chronicle-cli -- replay /tmp/run.ctrace
+cargo run -p chronicle-cli -- debug /tmp/run.ctrace
 cargo run -p chronicle-cli -- verify examples/plugin.casm
 cargo run -p chronicle-cli -- negotiate examples/plugin.chr --policy examples/plugin-mock.toml
 cargo run -p chronicle-cli -- assemble examples/plugin.casm --out /tmp/plugin.cmod
@@ -99,6 +100,19 @@ with spaced operators such as `a + b`, and capability calls like
 
 ```sh
 cargo bench -p chronicle-cli
+```
+
+## Trace Debugger
+
+```sh
+chronicle debug /tmp/plugin.ctrace
+```
+
+The interactive debugger supports `next`, `prev`, `jump N`, `regs`, `caps`,
+`event`, `source`, `help`, and `quit`. For scripted use and tests:
+
+```sh
+chronicle debug /tmp/plugin.ctrace --commands "source;next;regs;caps;quit"
 ```
 
 ## Safe Plugin Demo

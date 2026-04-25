@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -63,6 +64,11 @@ enum Command {
     },
     Inspect {
         trace: PathBuf,
+    },
+    Debug {
+        trace: PathBuf,
+        #[arg(long, help = "Run semicolon-separated debugger commands and exit")]
+        commands: Option<String>,
     },
 }
 
@@ -209,6 +215,10 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Debug { trace, commands } => {
+            let trace = load_trace(&trace)?;
+            run_debugger(&trace, commands.as_deref())?;
+        }
     }
     Ok(())
 }
@@ -334,6 +344,185 @@ fn print_replay_error(error: &ReplayError, verbose: bool) {
                 eprintln!("actual detail: {actual:#?}");
             }
         }
+    }
+}
+
+fn run_debugger(trace: &Trace, commands: Option<&str>) -> Result<()> {
+    if trace.events.is_empty() {
+        println!("trace has no events");
+        return Ok(());
+    }
+
+    let mut state = DebugState::new(trace);
+    print_debug_header(trace);
+    state.print_current(trace);
+
+    if let Some(commands) = commands {
+        for command in commands.split(';') {
+            if !state.handle(trace, command.trim())? {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
+    let stdin = io::stdin();
+    loop {
+        print!("chronicle-debug> ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
+        if !state.handle(trace, line.trim())? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn print_debug_header(trace: &Trace) {
+    println!(
+        "debugging module {} entry {}: {} events checksum {}",
+        trace.module.name,
+        trace.entry,
+        trace.events.len(),
+        trace.checksum
+    );
+    println!("commands: next, prev, jump N, regs, caps, event, source, help, quit");
+}
+
+struct DebugState {
+    index: usize,
+    registers_by_event: Vec<BTreeMap<usize, Value>>,
+}
+
+impl DebugState {
+    fn new(trace: &Trace) -> Self {
+        let mut registers = BTreeMap::new();
+        let mut registers_by_event = Vec::new();
+        for event in &trace.events {
+            for change in &event.register_changes {
+                registers.insert(change.register, change.value.clone());
+            }
+            registers_by_event.push(registers.clone());
+        }
+        Self {
+            index: 0,
+            registers_by_event,
+        }
+    }
+
+    fn handle(&mut self, trace: &Trace, command: &str) -> Result<bool> {
+        if command.is_empty() {
+            return Ok(true);
+        }
+        let mut parts = command.split_whitespace();
+        match parts.next().unwrap_or_default() {
+            "n" | "next" => {
+                if self.index + 1 < trace.events.len() {
+                    self.index += 1;
+                }
+                self.print_current(trace);
+            }
+            "p" | "prev" => {
+                self.index = self.index.saturating_sub(1);
+                self.print_current(trace);
+            }
+            "j" | "jump" => {
+                let Some(index) = parts.next() else {
+                    anyhow::bail!("jump expects an event index");
+                };
+                let index = index.parse::<usize>().context("invalid event index")?;
+                if index >= trace.events.len() {
+                    anyhow::bail!("event index {index} out of bounds");
+                }
+                self.index = index;
+                self.print_current(trace);
+            }
+            "r" | "regs" => self.print_registers(),
+            "c" | "caps" => self.print_caps(trace),
+            "e" | "event" => println!("{:#?}", trace.events[self.index]),
+            "s" | "source" => self.print_source(trace),
+            "h" | "help" => print_debug_header(trace),
+            "q" | "quit" | "exit" => return Ok(false),
+            other => println!("unknown command {other}; try help"),
+        }
+        Ok(true)
+    }
+
+    fn print_current(&self, trace: &Trace) {
+        let event = &trace.events[self.index];
+        println!(
+            "[{}/{}] {} pc={} line={:?} op={} checksum={}",
+            self.index,
+            trace.events.len() - 1,
+            event.function,
+            event.pc,
+            event.source_line,
+            event.opcode,
+            event.checksum
+        );
+        if let Some(capability) = &event.capability {
+            println!(
+                "cap {} {:?} -> {}",
+                capability.id,
+                capability.decision,
+                render_value(&capability.result)
+            );
+        }
+        for change in &event.register_changes {
+            println!("r{} = {}", change.register, render_value(&change.value));
+        }
+        if let Some(error) = &event.error {
+            println!("error: {error}");
+        }
+    }
+
+    fn print_registers(&self) {
+        let Some(registers) = self.registers_by_event.get(self.index) else {
+            return;
+        };
+        if registers.is_empty() {
+            println!("registers: <empty>");
+            return;
+        }
+        println!("registers:");
+        for (register, value) in registers {
+            println!("  r{} = {}", register, render_value(value));
+        }
+    }
+
+    fn print_caps(&self, trace: &Trace) {
+        let mut seen = 0;
+        for (index, event) in trace.events.iter().enumerate().take(self.index + 1) {
+            if let Some(capability) = &event.capability {
+                seen += 1;
+                println!(
+                    "#{index} {} {:?} args=[{}] -> {}",
+                    capability.id,
+                    capability.decision,
+                    capability
+                        .args
+                        .iter()
+                        .map(render_value)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    render_value(&capability.result)
+                );
+            }
+        }
+        if seen == 0 {
+            println!("capabilities: <none yet>");
+        }
+    }
+
+    fn print_source(&self, trace: &Trace) {
+        let event = &trace.events[self.index];
+        println!(
+            "{} pc={} line={:?} op={}",
+            event.function, event.pc, event.source_line, event.opcode
+        );
     }
 }
 

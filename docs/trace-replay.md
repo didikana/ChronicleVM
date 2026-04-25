@@ -27,6 +27,13 @@ final checksum over the replay-relevant event stream.
 - On divergence, the first mismatching event is reported with expected and
   actual function, program counter, source line, opcode, and checksum.
 
+## Interactive Debugging
+
+`chronicle debug trace.ctrace` opens a small trace debugger over the recorded
+event stream. It never re-executes the VM; it reconstructs register state from
+recorded register changes and lets the user step through the trace with
+`next`, `prev`, `jump N`, `regs`, `caps`, `event`, and `source`.
+
 ## Determinism
 
 - Mocked capabilities are deterministic by policy.
