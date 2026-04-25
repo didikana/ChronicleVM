@@ -1,0 +1,4 @@
+[capabilities]
+"log.print" = "grant"
+"clock.now" = "grant"
+"random.u64" = "grant"

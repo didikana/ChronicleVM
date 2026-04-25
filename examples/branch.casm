@@ -1,0 +1,13 @@
+.module "branch-demo"
+
+.fn main r5
+  const r0, 3
+  const r1, 7
+  lt r2, r0, r1
+  jump_if r2, smaller
+  const r3, "not smaller"
+  ret r3
+smaller:
+  const r4, "smaller"
+  ret r4
+.end

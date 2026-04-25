@@ -1,0 +1,9 @@
+[package]
+name = "chronicle-asm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chronicle-core = { path = "../chronicle-core" }
+thiserror.workspace = true
