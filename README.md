@@ -20,7 +20,7 @@ cargo run -p chronicle-cli -- trace examples/clock.casm --policy examples/policy
 cargo run -p chronicle-cli -- inspect /tmp/run.ctrace
 cargo run -p chronicle-cli -- replay /tmp/run.ctrace
 cargo run -p chronicle-cli -- verify examples/plugin.casm
-cargo run -p chronicle-cli -- assemble examples/plugin.casm --out /tmp/plugin.json
+cargo run -p chronicle-cli -- assemble examples/plugin.casm --out /tmp/plugin.cmod
 cargo run -p chronicle-cli -- run examples/plugin.casm --policy examples/plugin-mock.toml
 ```
 
@@ -50,6 +50,12 @@ registers are `r0` through `rN-1`. For callable functions, add `arity=N`.
 ```
 
 Any undeclared or unlisted capability is denied by default.
+
+## Binary Modules
+
+`chronicle assemble` writes Chronicle binary modules with a `CHVMOD1` header.
+The CLI can run or verify `.casm` source modules, binary modules such as
+`.cmod`, and legacy JSON module files.
 
 ## Safe Plugin Demo
 

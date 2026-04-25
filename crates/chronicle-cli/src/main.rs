@@ -150,19 +150,21 @@ fn main() -> Result<()> {
 }
 
 fn load_module(path: &PathBuf) -> Result<Module> {
-    let source = fs::read_to_string(path)
-        .with_context(|| format!("failed to read module {}", path.display()))?;
-    let module = if path.extension().and_then(|value| value.to_str()) == Some("json") {
-        Module::from_bytes(source.as_bytes())?
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read module {}", path.display()))?;
+    let module = if path.extension().and_then(|value| value.to_str()) == Some("casm") {
+        let source = std::str::from_utf8(&bytes).context("assembly module is not valid UTF-8")?;
+        Assembler::parse(source)?
     } else {
-        Assembler::parse(&source)?
+        Module::from_bytes(&bytes)?
     };
     Verifier::verify(&module)?;
     Ok(module)
 }
 
 fn load_trace(path: &PathBuf) -> Result<Trace> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read trace {}", path.display()))?;
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read trace {}", path.display()))?;
     serde_json::from_slice(&bytes).context("failed to decode trace")
 }
 
@@ -176,7 +178,10 @@ struct RawPolicy {
 #[serde(untagged)]
 enum RawDecision {
     Text(String),
-    Table { decision: Option<String>, mock: Option<toml::Value> },
+    Table {
+        decision: Option<String>,
+        mock: Option<toml::Value>,
+    },
 }
 
 fn load_policy(path: &PathBuf) -> Result<HostPolicy> {

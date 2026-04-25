@@ -67,7 +67,9 @@ impl<'a> Parser<'a> {
             }
 
             if line == ".end" {
-                let builder = current.take().ok_or_else(|| err(line_no, ".end without .fn"))?;
+                let builder = current
+                    .take()
+                    .ok_or_else(|| err(line_no, ".end without .fn"))?;
                 self.finish_function(line_no, builder)?;
                 continue;
             }
@@ -75,7 +77,9 @@ impl<'a> Parser<'a> {
             if current.is_some() {
                 if let Some(label) = line.strip_suffix(':') {
                     let builder = current.as_mut().expect("checked above");
-                    builder.labels.insert(label.trim().to_string(), builder.pending.len());
+                    builder
+                        .labels
+                        .insert(label.trim().to_string(), builder.pending.len());
                 } else {
                     let instruction = self.parse_instruction(line_no, line)?;
                     let builder = current.as_mut().expect("checked above");
@@ -85,7 +89,10 @@ impl<'a> Parser<'a> {
             }
 
             if line.starts_with(".module ") {
-                self.module_name = Some(parse_quoted(line_no, line.trim_start_matches(".module ").trim())?);
+                self.module_name = Some(parse_quoted(
+                    line_no,
+                    line.trim_start_matches(".module ").trim(),
+                )?);
             } else if line.starts_with(".cap ") {
                 self.capabilities.push(parse_capability(line_no, line)?);
             } else if line.starts_with(".fn ") {
@@ -104,13 +111,20 @@ impl<'a> Parser<'a> {
 
         let name = self.module_name.ok_or(AsmError::MissingModule)?;
         for (index, function) in self.functions.iter().enumerate() {
-            if self.exports.contains_key(&function.name) || self.exports.is_empty() || function.name == "main" {
+            if self.exports.contains_key(&function.name)
+                || self.exports.is_empty()
+                || function.name == "main"
+            {
                 self.exports.insert(function.name.clone(), index);
             }
         }
         for (export, index) in self.exports.iter_mut() {
             if *index == usize::MAX {
-                let Some(found) = self.functions.iter().position(|function| function.name == *export) else {
+                let Some(found) = self
+                    .functions
+                    .iter()
+                    .position(|function| function.name == *export)
+                else {
                     return Err(err(0, format!("export {export} does not name a function")));
                 };
                 *index = found;
@@ -218,7 +232,10 @@ impl<'a> Parser<'a> {
             }
             "call" => {
                 if args.len() < 2 {
-                    return Err(err(line_no, "call expects dst, function, and optional args"));
+                    return Err(err(
+                        line_no,
+                        "call expects dst, function, and optional args",
+                    ));
                 }
                 ready(Instruction::Call {
                     dst: parse_register(line_no, &args[0])?,
@@ -234,7 +251,10 @@ impl<'a> Parser<'a> {
             }
             "cap_call" => {
                 if args.len() < 2 {
-                    return Err(err(line_no, "cap_call expects dst, capability, and optional args"));
+                    return Err(err(
+                        line_no,
+                        "cap_call expects dst, capability, and optional args",
+                    ));
                 }
                 ready(Instruction::CapCall {
                     dst: parse_register(line_no, &args[0])?,
@@ -244,7 +264,10 @@ impl<'a> Parser<'a> {
             }
             "array_new" => {
                 if args.is_empty() {
-                    return Err(err(line_no, "array_new expects dst and optional item registers"));
+                    return Err(err(
+                        line_no,
+                        "array_new expects dst and optional item registers",
+                    ));
                 }
                 ready(Instruction::ArrayNew {
                     dst: parse_register(line_no, &args[0])?,
@@ -272,7 +295,11 @@ impl<'a> Parser<'a> {
     }
 
     fn intern_constant(&mut self, value: Value) -> usize {
-        if let Some(index) = self.constants.iter().position(|existing| existing == &value) {
+        if let Some(index) = self
+            .constants
+            .iter()
+            .position(|existing| existing == &value)
+        {
             index
         } else {
             self.constants.push(value);
@@ -368,7 +395,10 @@ fn parse_register_count(line_no: usize, token: &str) -> Result<usize> {
 }
 
 fn parse_registers(line_no: usize, tokens: &[String]) -> Result<Vec<usize>> {
-    tokens.iter().map(|token| parse_register(line_no, token)).collect()
+    tokens
+        .iter()
+        .map(|token| parse_register(line_no, token))
+        .collect()
 }
 
 fn split_operands(line_no: usize, input: &str) -> Result<Vec<String>> {
@@ -494,7 +524,8 @@ mod tests {
         "#;
         let module = Assembler::parse(source).unwrap();
         Verifier::verify(&module).unwrap();
-        let mut vm = chronicle_core::Vm::new(module, chronicle_core::HostPolicy::default()).unwrap();
+        let mut vm =
+            chronicle_core::Vm::new(module, chronicle_core::HostPolicy::default()).unwrap();
         assert_eq!(vm.run_entry("main").unwrap(), Value::I64(2));
     }
 

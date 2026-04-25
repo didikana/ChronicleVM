@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+const MODULE_MAGIC: &[u8; 8] = b"CHVMOD1\0";
+
 #[derive(Debug, Error)]
 pub enum ChronicleError {
     #[error("decode error: {0}")]
@@ -62,15 +64,27 @@ pub struct Module {
 
 impl Module {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(|err| ChronicleError::Decode(err.to_string()))
+        if bytes.starts_with(MODULE_MAGIC) {
+            BinaryModuleReader::new(bytes).read_module()
+        } else {
+            serde_json::from_slice(bytes).map_err(|err| ChronicleError::Decode(err.to_string()))
+        }
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut writer = BinaryModuleWriter::default();
+        writer.write_module(self)?;
+        Ok(writer.bytes)
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
         serde_json::to_vec_pretty(self).map_err(|err| ChronicleError::Decode(err.to_string()))
     }
 
     pub fn function_index(&self, name: &str) -> Option<usize> {
-        self.functions.iter().position(|function| function.name == name)
+        self.functions
+            .iter()
+            .position(|function| function.name == name)
     }
 }
 
@@ -86,22 +100,78 @@ pub struct Function {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Instruction {
-    Const { dst: usize, constant: usize },
-    Move { dst: usize, src: usize },
-    Add { dst: usize, lhs: usize, rhs: usize },
-    Sub { dst: usize, lhs: usize, rhs: usize },
-    Mul { dst: usize, lhs: usize, rhs: usize },
-    Div { dst: usize, lhs: usize, rhs: usize },
-    Eq { dst: usize, lhs: usize, rhs: usize },
-    Lt { dst: usize, lhs: usize, rhs: usize },
-    Jump { target: usize },
-    JumpIf { cond: usize, target: usize },
-    Call { dst: usize, function: String, args: Vec<usize> },
-    Ret { src: usize },
-    CapCall { dst: usize, capability: String, args: Vec<usize> },
-    ArrayNew { dst: usize, items: Vec<usize> },
-    ArrayGet { dst: usize, array: usize, index: usize },
-    ArraySet { array: usize, index: usize, value: usize },
+    Const {
+        dst: usize,
+        constant: usize,
+    },
+    Move {
+        dst: usize,
+        src: usize,
+    },
+    Add {
+        dst: usize,
+        lhs: usize,
+        rhs: usize,
+    },
+    Sub {
+        dst: usize,
+        lhs: usize,
+        rhs: usize,
+    },
+    Mul {
+        dst: usize,
+        lhs: usize,
+        rhs: usize,
+    },
+    Div {
+        dst: usize,
+        lhs: usize,
+        rhs: usize,
+    },
+    Eq {
+        dst: usize,
+        lhs: usize,
+        rhs: usize,
+    },
+    Lt {
+        dst: usize,
+        lhs: usize,
+        rhs: usize,
+    },
+    Jump {
+        target: usize,
+    },
+    JumpIf {
+        cond: usize,
+        target: usize,
+    },
+    Call {
+        dst: usize,
+        function: String,
+        args: Vec<usize>,
+    },
+    Ret {
+        src: usize,
+    },
+    CapCall {
+        dst: usize,
+        capability: String,
+        args: Vec<usize>,
+    },
+    ArrayNew {
+        dst: usize,
+        items: Vec<usize>,
+    },
+    ArrayGet {
+        dst: usize,
+        array: usize,
+        index: usize,
+    },
+    ArraySet {
+        array: usize,
+        index: usize,
+        value: usize,
+    },
 }
 
 impl Instruction {
@@ -123,6 +193,426 @@ impl Instruction {
             Instruction::ArrayNew { .. } => "array_new",
             Instruction::ArrayGet { .. } => "array_get",
             Instruction::ArraySet { .. } => "array_set",
+        }
+    }
+}
+
+#[derive(Default)]
+struct BinaryModuleWriter {
+    bytes: Vec<u8>,
+}
+
+impl BinaryModuleWriter {
+    fn write_module(&mut self, module: &Module) -> Result<()> {
+        self.bytes.extend_from_slice(MODULE_MAGIC);
+        self.write_string(&module.name)?;
+        self.write_len(module.constants.len())?;
+        for value in &module.constants {
+            self.write_value(value)?;
+        }
+        self.write_len(module.capabilities.len())?;
+        for capability in &module.capabilities {
+            self.write_string(&capability.name)?;
+            self.write_optional_string(capability.reason.as_deref())?;
+        }
+        self.write_len(module.functions.len())?;
+        for function in &module.functions {
+            self.write_string(&function.name)?;
+            self.write_usize(function.registers)?;
+            self.write_usize(function.arity)?;
+            self.write_len(function.code.len())?;
+            for instruction in &function.code {
+                self.write_instruction(instruction)?;
+            }
+            self.write_len(function.source_lines.len())?;
+            for line in &function.source_lines {
+                match line {
+                    Some(line) => {
+                        self.write_u8(1);
+                        self.write_usize(*line)?;
+                    }
+                    None => self.write_u8(0),
+                }
+            }
+        }
+        self.write_len(module.exports.len())?;
+        for (name, index) in &module.exports {
+            self.write_string(name)?;
+            self.write_usize(*index)?;
+        }
+        Ok(())
+    }
+
+    fn write_instruction(&mut self, instruction: &Instruction) -> Result<()> {
+        match instruction {
+            Instruction::Const { dst, constant } => {
+                self.write_u8(0);
+                self.write_usize(*dst)?;
+                self.write_usize(*constant)?;
+            }
+            Instruction::Move { dst, src } => {
+                self.write_u8(1);
+                self.write_usize(*dst)?;
+                self.write_usize(*src)?;
+            }
+            Instruction::Add { dst, lhs, rhs } => self.write_three_reg(2, *dst, *lhs, *rhs)?,
+            Instruction::Sub { dst, lhs, rhs } => self.write_three_reg(3, *dst, *lhs, *rhs)?,
+            Instruction::Mul { dst, lhs, rhs } => self.write_three_reg(4, *dst, *lhs, *rhs)?,
+            Instruction::Div { dst, lhs, rhs } => self.write_three_reg(5, *dst, *lhs, *rhs)?,
+            Instruction::Eq { dst, lhs, rhs } => self.write_three_reg(6, *dst, *lhs, *rhs)?,
+            Instruction::Lt { dst, lhs, rhs } => self.write_three_reg(7, *dst, *lhs, *rhs)?,
+            Instruction::Jump { target } => {
+                self.write_u8(8);
+                self.write_usize(*target)?;
+            }
+            Instruction::JumpIf { cond, target } => {
+                self.write_u8(9);
+                self.write_usize(*cond)?;
+                self.write_usize(*target)?;
+            }
+            Instruction::Call {
+                dst,
+                function,
+                args,
+            } => {
+                self.write_u8(10);
+                self.write_usize(*dst)?;
+                self.write_string(function)?;
+                self.write_usize_vec(args)?;
+            }
+            Instruction::Ret { src } => {
+                self.write_u8(11);
+                self.write_usize(*src)?;
+            }
+            Instruction::CapCall {
+                dst,
+                capability,
+                args,
+            } => {
+                self.write_u8(12);
+                self.write_usize(*dst)?;
+                self.write_string(capability)?;
+                self.write_usize_vec(args)?;
+            }
+            Instruction::ArrayNew { dst, items } => {
+                self.write_u8(13);
+                self.write_usize(*dst)?;
+                self.write_usize_vec(items)?;
+            }
+            Instruction::ArrayGet { dst, array, index } => {
+                self.write_u8(14);
+                self.write_usize(*dst)?;
+                self.write_usize(*array)?;
+                self.write_usize(*index)?;
+            }
+            Instruction::ArraySet {
+                array,
+                index,
+                value,
+            } => {
+                self.write_u8(15);
+                self.write_usize(*array)?;
+                self.write_usize(*index)?;
+                self.write_usize(*value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_three_reg(&mut self, tag: u8, dst: usize, lhs: usize, rhs: usize) -> Result<()> {
+        self.write_u8(tag);
+        self.write_usize(dst)?;
+        self.write_usize(lhs)?;
+        self.write_usize(rhs)?;
+        Ok(())
+    }
+
+    fn write_value(&mut self, value: &Value) -> Result<()> {
+        match value {
+            Value::Nil => self.write_u8(0),
+            Value::Bool(value) => {
+                self.write_u8(1);
+                self.write_u8(u8::from(*value));
+            }
+            Value::I64(value) => {
+                self.write_u8(2);
+                self.bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::F64(value) => {
+                self.write_u8(3);
+                self.bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::String(value) => {
+                self.write_u8(4);
+                self.write_string(value)?;
+            }
+            Value::Array(values) => {
+                self.write_u8(5);
+                self.write_len(values.len())?;
+                for value in values {
+                    self.write_value(value)?;
+                }
+            }
+            Value::Function(value) => {
+                self.write_u8(6);
+                self.write_string(value)?;
+            }
+            Value::Capability(value) => {
+                self.write_u8(7);
+                self.write_string(value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_optional_string(&mut self, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(value) => {
+                self.write_u8(1);
+                self.write_string(value)?;
+            }
+            None => self.write_u8(0),
+        }
+        Ok(())
+    }
+
+    fn write_usize_vec(&mut self, values: &[usize]) -> Result<()> {
+        self.write_len(values.len())?;
+        for value in values {
+            self.write_usize(*value)?;
+        }
+        Ok(())
+    }
+
+    fn write_string(&mut self, value: &str) -> Result<()> {
+        self.write_len(value.len())?;
+        self.bytes.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+
+    fn write_len(&mut self, value: usize) -> Result<()> {
+        self.write_usize(value)
+    }
+
+    fn write_usize(&mut self, value: usize) -> Result<()> {
+        let value = u32::try_from(value)
+            .map_err(|_| ChronicleError::Decode("value exceeds binary module u32 limit".into()))?;
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+}
+
+struct BinaryModuleReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> BinaryModuleReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_module(&mut self) -> Result<Module> {
+        self.expect_magic()?;
+        let name = self.read_string()?;
+        let constants = self.read_many(Self::read_value)?;
+        let capabilities = self.read_many(|reader| {
+            Ok(CapabilityDecl {
+                name: reader.read_string()?,
+                reason: reader.read_optional_string()?,
+            })
+        })?;
+        let functions = self.read_many(|reader| {
+            let name = reader.read_string()?;
+            let registers = reader.read_usize()?;
+            let arity = reader.read_usize()?;
+            let code = reader.read_many(Self::read_instruction)?;
+            let source_lines = reader.read_many(|reader| {
+                Ok(match reader.read_u8()? {
+                    0 => None,
+                    1 => Some(reader.read_usize()?),
+                    tag => {
+                        return Err(ChronicleError::Decode(format!(
+                            "invalid source line tag {tag}"
+                        )))
+                    }
+                })
+            })?;
+            Ok(Function {
+                name,
+                registers,
+                arity,
+                code,
+                source_lines,
+            })
+        })?;
+        let exports = self.read_many(|reader| Ok((reader.read_string()?, reader.read_usize()?)))?;
+        if self.offset != self.bytes.len() {
+            return Err(ChronicleError::Decode(
+                "trailing bytes in binary module".into(),
+            ));
+        }
+        Ok(Module {
+            name,
+            constants,
+            capabilities,
+            functions,
+            exports: exports.into_iter().collect(),
+        })
+    }
+
+    fn read_instruction(&mut self) -> Result<Instruction> {
+        Ok(match self.read_u8()? {
+            0 => Instruction::Const {
+                dst: self.read_usize()?,
+                constant: self.read_usize()?,
+            },
+            1 => Instruction::Move {
+                dst: self.read_usize()?,
+                src: self.read_usize()?,
+            },
+            2 => self.read_three_reg(|dst, lhs, rhs| Instruction::Add { dst, lhs, rhs })?,
+            3 => self.read_three_reg(|dst, lhs, rhs| Instruction::Sub { dst, lhs, rhs })?,
+            4 => self.read_three_reg(|dst, lhs, rhs| Instruction::Mul { dst, lhs, rhs })?,
+            5 => self.read_three_reg(|dst, lhs, rhs| Instruction::Div { dst, lhs, rhs })?,
+            6 => self.read_three_reg(|dst, lhs, rhs| Instruction::Eq { dst, lhs, rhs })?,
+            7 => self.read_three_reg(|dst, lhs, rhs| Instruction::Lt { dst, lhs, rhs })?,
+            8 => Instruction::Jump {
+                target: self.read_usize()?,
+            },
+            9 => Instruction::JumpIf {
+                cond: self.read_usize()?,
+                target: self.read_usize()?,
+            },
+            10 => Instruction::Call {
+                dst: self.read_usize()?,
+                function: self.read_string()?,
+                args: self.read_usize_vec()?,
+            },
+            11 => Instruction::Ret {
+                src: self.read_usize()?,
+            },
+            12 => Instruction::CapCall {
+                dst: self.read_usize()?,
+                capability: self.read_string()?,
+                args: self.read_usize_vec()?,
+            },
+            13 => Instruction::ArrayNew {
+                dst: self.read_usize()?,
+                items: self.read_usize_vec()?,
+            },
+            14 => Instruction::ArrayGet {
+                dst: self.read_usize()?,
+                array: self.read_usize()?,
+                index: self.read_usize()?,
+            },
+            15 => Instruction::ArraySet {
+                array: self.read_usize()?,
+                index: self.read_usize()?,
+                value: self.read_usize()?,
+            },
+            tag => {
+                return Err(ChronicleError::Decode(format!(
+                    "unknown instruction tag {tag}"
+                )))
+            }
+        })
+    }
+
+    fn read_three_reg(
+        &mut self,
+        make: impl FnOnce(usize, usize, usize) -> Instruction,
+    ) -> Result<Instruction> {
+        let dst = self.read_usize()?;
+        let lhs = self.read_usize()?;
+        let rhs = self.read_usize()?;
+        Ok(make(dst, lhs, rhs))
+    }
+
+    fn read_value(&mut self) -> Result<Value> {
+        Ok(match self.read_u8()? {
+            0 => Value::Nil,
+            1 => Value::Bool(match self.read_u8()? {
+                0 => false,
+                1 => true,
+                tag => return Err(ChronicleError::Decode(format!("invalid bool tag {tag}"))),
+            }),
+            2 => Value::I64(i64::from_le_bytes(self.read_array()?)),
+            3 => Value::F64(f64::from_le_bytes(self.read_array()?)),
+            4 => Value::String(self.read_string()?),
+            5 => Value::Array(self.read_many(Self::read_value)?),
+            6 => Value::Function(self.read_string()?),
+            7 => Value::Capability(self.read_string()?),
+            tag => return Err(ChronicleError::Decode(format!("unknown value tag {tag}"))),
+        })
+    }
+
+    fn read_optional_string(&mut self) -> Result<Option<String>> {
+        Ok(match self.read_u8()? {
+            0 => None,
+            1 => Some(self.read_string()?),
+            tag => return Err(ChronicleError::Decode(format!("invalid option tag {tag}"))),
+        })
+    }
+
+    fn read_usize_vec(&mut self) -> Result<Vec<usize>> {
+        self.read_many(Self::read_usize)
+    }
+
+    fn read_many<T>(&mut self, mut read: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<T>> {
+        let len = self.read_usize()?;
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(read(self)?);
+        }
+        Ok(values)
+    }
+
+    fn read_string(&mut self) -> Result<String> {
+        let len = self.read_usize()?;
+        let bytes = self.take(len)?;
+        String::from_utf8(bytes.to_vec()).map_err(|err| ChronicleError::Decode(err.to_string()))
+    }
+
+    fn read_usize(&mut self) -> Result<usize> {
+        Ok(u32::from_le_bytes(self.read_array()?) as usize)
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| ChronicleError::Decode("failed to read fixed-width bytes".into()))
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| ChronicleError::Decode("binary module offset overflow".into()))?;
+        if end > self.bytes.len() {
+            return Err(ChronicleError::Decode(
+                "unexpected end of binary module".into(),
+            ));
+        }
+        let bytes = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn expect_magic(&mut self) -> Result<()> {
+        let magic = self.take(MODULE_MAGIC.len())?;
+        if magic == MODULE_MAGIC {
+            Ok(())
+        } else {
+            Err(ChronicleError::Decode("invalid binary module magic".into()))
         }
     }
 }
@@ -152,7 +642,9 @@ impl Verifier {
                     function.name
                 )));
             }
-            if !function.source_lines.is_empty() && function.source_lines.len() != function.code.len() {
+            if !function.source_lines.is_empty()
+                && function.source_lines.len() != function.code.len()
+            {
                 return Err(ChronicleError::Verify(format!(
                     "function {} source line map length does not match code length",
                     function.name
@@ -167,7 +659,12 @@ impl Verifier {
     }
 }
 
-fn verify_instruction(module: &Module, function: &Function, pc: usize, instruction: &Instruction) -> Result<()> {
+fn verify_instruction(
+    module: &Module,
+    function: &Function,
+    pc: usize,
+    instruction: &Instruction,
+) -> Result<()> {
     let reg = |register: usize| -> Result<()> {
         if register >= function.registers {
             Err(ChronicleError::Verify(format!(
@@ -213,12 +710,21 @@ fn verify_instruction(module: &Module, function: &Function, pc: usize, instructi
             reg(*lhs)?;
             reg(*rhs)?;
         }
-        Instruction::Jump { target: jump_target } => target(*jump_target)?,
-        Instruction::JumpIf { cond, target: jump_target } => {
+        Instruction::Jump {
+            target: jump_target,
+        } => target(*jump_target)?,
+        Instruction::JumpIf {
+            cond,
+            target: jump_target,
+        } => {
             reg(*cond)?;
             target(*jump_target)?;
         }
-        Instruction::Call { dst, function: callee, args } => {
+        Instruction::Call {
+            dst,
+            function: callee,
+            args,
+        } => {
             reg(*dst)?;
             for arg in args {
                 reg(*arg)?;
@@ -239,12 +745,20 @@ fn verify_instruction(module: &Module, function: &Function, pc: usize, instructi
             }
         }
         Instruction::Ret { src } => reg(*src)?,
-        Instruction::CapCall { dst, capability, args } => {
+        Instruction::CapCall {
+            dst,
+            capability,
+            args,
+        } => {
             reg(*dst)?;
             for arg in args {
                 reg(*arg)?;
             }
-            if !module.capabilities.iter().any(|decl| decl.name == *capability) {
+            if !module
+                .capabilities
+                .iter()
+                .any(|decl| decl.name == *capability)
+            {
                 return Err(ChronicleError::Verify(format!(
                     "{} pc {pc}: capability {capability} was not declared",
                     function.name
@@ -262,7 +776,11 @@ fn verify_instruction(module: &Module, function: &Function, pc: usize, instructi
             reg(*array)?;
             reg(*index)?;
         }
-        Instruction::ArraySet { array, index, value } => {
+        Instruction::ArraySet {
+            array,
+            index,
+            value,
+        } => {
             reg(*array)?;
             reg(*index)?;
             reg(*value)?;
@@ -408,10 +926,14 @@ impl Vm {
         let (result, events) = vm.execute_collect(&trace.entry, false);
         let result = result?;
         if events != trace.events {
-            return Err(ChronicleError::Replay("trace events did not match replay".into()));
+            return Err(ChronicleError::Replay(
+                "trace events did not match replay".into(),
+            ));
         }
         if Some(result.clone()) != trace.result {
-            return Err(ChronicleError::Replay("trace result did not match replay".into()));
+            return Err(ChronicleError::Replay(
+                "trace result did not match replay".into(),
+            ));
         }
         Ok(ReplayReport {
             events_checked: events.len(),
@@ -419,11 +941,17 @@ impl Vm {
         })
     }
 
-    fn execute_collect(&mut self, entry: &str, live_capabilities: bool) -> (Result<Value>, Vec<TraceEvent>) {
+    fn execute_collect(
+        &mut self,
+        entry: &str,
+        live_capabilities: bool,
+    ) -> (Result<Value>, Vec<TraceEvent>) {
         let mut events = Vec::new();
         let Some(index) = self.module.exports.get(entry).copied() else {
             return (
-                Err(ChronicleError::Runtime(format!("missing entry export {entry}"))),
+                Err(ChronicleError::Runtime(format!(
+                    "missing entry export {entry}"
+                ))),
                 events,
             );
         };
@@ -499,32 +1027,62 @@ impl Vm {
     ) -> Result<Option<Value>> {
         match instruction {
             Instruction::Const { dst, constant } => {
-                set_reg(registers, event, *dst, self.module.constants[*constant].clone());
+                set_reg(
+                    registers,
+                    event,
+                    *dst,
+                    self.module.constants[*constant].clone(),
+                );
             }
             Instruction::Move { dst, src } => {
                 set_reg(registers, event, *dst, registers[*src].clone());
             }
             Instruction::Add { dst, lhs, rhs } => {
-                let value = numeric(registers[*lhs].clone(), registers[*rhs].clone(), |a, b| a + b, |a, b| a + b)?;
+                let value = numeric(
+                    registers[*lhs].clone(),
+                    registers[*rhs].clone(),
+                    |a, b| a + b,
+                    |a, b| a + b,
+                )?;
                 set_reg(registers, event, *dst, value);
             }
             Instruction::Sub { dst, lhs, rhs } => {
-                let value = numeric(registers[*lhs].clone(), registers[*rhs].clone(), |a, b| a - b, |a, b| a - b)?;
+                let value = numeric(
+                    registers[*lhs].clone(),
+                    registers[*rhs].clone(),
+                    |a, b| a - b,
+                    |a, b| a - b,
+                )?;
                 set_reg(registers, event, *dst, value);
             }
             Instruction::Mul { dst, lhs, rhs } => {
-                let value = numeric(registers[*lhs].clone(), registers[*rhs].clone(), |a, b| a * b, |a, b| a * b)?;
+                let value = numeric(
+                    registers[*lhs].clone(),
+                    registers[*rhs].clone(),
+                    |a, b| a * b,
+                    |a, b| a * b,
+                )?;
                 set_reg(registers, event, *dst, value);
             }
             Instruction::Div { dst, lhs, rhs } => {
                 if matches!(&registers[*rhs], Value::I64(0) | Value::F64(0.0)) {
                     return Err(ChronicleError::Runtime("division by zero".into()));
                 }
-                let value = numeric(registers[*lhs].clone(), registers[*rhs].clone(), |a, b| a / b, |a, b| a / b)?;
+                let value = numeric(
+                    registers[*lhs].clone(),
+                    registers[*rhs].clone(),
+                    |a, b| a / b,
+                    |a, b| a / b,
+                )?;
                 set_reg(registers, event, *dst, value);
             }
             Instruction::Eq { dst, lhs, rhs } => {
-                set_reg(registers, event, *dst, Value::Bool(registers[*lhs] == registers[*rhs]));
+                set_reg(
+                    registers,
+                    event,
+                    *dst,
+                    Value::Bool(registers[*lhs] == registers[*rhs]),
+                );
             }
             Instruction::Lt { dst, lhs, rhs } => {
                 let value = compare_lt(&registers[*lhs], &registers[*rhs])?;
@@ -536,18 +1094,32 @@ impl Vm {
                     *next_pc = *target;
                 }
             }
-            Instruction::Call { dst, function: callee, args } => {
-                let callee_index = self.module.function_index(callee).ok_or_else(|| {
-                    ChronicleError::Runtime(format!("missing callee {callee}"))
-                })?;
+            Instruction::Call {
+                dst,
+                function: callee,
+                args,
+            } => {
+                let callee_index = self
+                    .module
+                    .function_index(callee)
+                    .ok_or_else(|| ChronicleError::Runtime(format!("missing callee {callee}")))?;
                 let call_args = args.iter().map(|arg| registers[*arg].clone()).collect();
-                let value = self.execute_function(callee_index, call_args, events, live_capabilities)?;
+                let value =
+                    self.execute_function(callee_index, call_args, events, live_capabilities)?;
                 set_reg(registers, event, *dst, value);
             }
             Instruction::Ret { src } => return Ok(Some(registers[*src].clone())),
-            Instruction::CapCall { dst, capability, args } => {
-                let call_args = args.iter().map(|arg| registers[*arg].clone()).collect::<Vec<_>>();
-                let value = self.call_capability(capability, call_args.clone(), live_capabilities)?;
+            Instruction::CapCall {
+                dst,
+                capability,
+                args,
+            } => {
+                let call_args = args
+                    .iter()
+                    .map(|arg| registers[*arg].clone())
+                    .collect::<Vec<_>>();
+                let value =
+                    self.call_capability(capability, call_args.clone(), live_capabilities)?;
                 event.capability = Some(CapabilityTrace {
                     name: capability.clone(),
                     args: call_args,
@@ -556,28 +1128,38 @@ impl Vm {
                 set_reg(registers, event, *dst, value);
             }
             Instruction::ArrayNew { dst, items } => {
-                let value = Value::Array(items.iter().map(|item| registers[*item].clone()).collect());
+                let value =
+                    Value::Array(items.iter().map(|item| registers[*item].clone()).collect());
                 set_reg(registers, event, *dst, value);
             }
             Instruction::ArrayGet { dst, array, index } => {
                 let Value::Array(items) = &registers[*array] else {
-                    return Err(ChronicleError::Runtime("array_get target is not an array".into()));
+                    return Err(ChronicleError::Runtime(
+                        "array_get target is not an array".into(),
+                    ));
                 };
                 let item_index = value_to_index(&registers[*index])?;
-                let value = items
-                    .get(item_index)
-                    .cloned()
-                    .ok_or_else(|| ChronicleError::Runtime(format!("array index {item_index} out of bounds")))?;
+                let value = items.get(item_index).cloned().ok_or_else(|| {
+                    ChronicleError::Runtime(format!("array index {item_index} out of bounds"))
+                })?;
                 set_reg(registers, event, *dst, value);
             }
-            Instruction::ArraySet { array, index, value } => {
+            Instruction::ArraySet {
+                array,
+                index,
+                value,
+            } => {
                 let item_index = value_to_index(&registers[*index])?;
                 let new_value = registers[*value].clone();
                 let Value::Array(items) = &mut registers[*array] else {
-                    return Err(ChronicleError::Runtime("array_set target is not an array".into()));
+                    return Err(ChronicleError::Runtime(
+                        "array_set target is not an array".into(),
+                    ));
                 };
                 let Some(slot) = items.get_mut(item_index) else {
-                    return Err(ChronicleError::Runtime(format!("array index {item_index} out of bounds")));
+                    return Err(ChronicleError::Runtime(format!(
+                        "array index {item_index} out of bounds"
+                    )));
                 };
                 *slot = new_value;
                 event.register_changes.push(RegisterChange {
@@ -592,8 +1174,14 @@ impl Vm {
 
     fn call_capability(&mut self, name: &str, args: Vec<Value>, live: bool) -> Result<Value> {
         if !live {
-            let Some(recorded) = self.replay_capabilities.get(self.replay_capability_index).cloned() else {
-                return Err(ChronicleError::Replay(format!("missing recorded capability {name}")));
+            let Some(recorded) = self
+                .replay_capabilities
+                .get(self.replay_capability_index)
+                .cloned()
+            else {
+                return Err(ChronicleError::Replay(format!(
+                    "missing recorded capability {name}"
+                )));
             };
             self.replay_capability_index += 1;
             if recorded.name != name || recorded.args != args {
@@ -607,16 +1195,18 @@ impl Vm {
         match self.capabilities.get(name) {
             Some(CapabilityDecision::Grant) => builtin_capability(name, &args),
             Some(CapabilityDecision::Mock(value)) => Ok(value.clone()),
-            Some(CapabilityDecision::Deny) | None => {
-                Err(ChronicleError::Capability(format!("capability {name} unavailable")))
-            }
+            Some(CapabilityDecision::Deny) | None => Err(ChronicleError::Capability(format!(
+                "capability {name} unavailable"
+            ))),
         }
     }
 }
 
 fn set_reg(registers: &mut [Value], event: &mut TraceEvent, register: usize, value: Value) {
     registers[register] = value.clone();
-    event.register_changes.push(RegisterChange { register, value });
+    event
+        .register_changes
+        .push(RegisterChange { register, value });
 }
 
 fn numeric(
@@ -647,7 +1237,9 @@ fn compare_lt(lhs: &Value, rhs: &Value) -> Result<bool> {
 fn value_to_index(value: &Value) -> Result<usize> {
     match value {
         Value::I64(index) if *index >= 0 => Ok(*index as usize),
-        _ => Err(ChronicleError::Runtime("array index must be a non-negative i64".into())),
+        _ => Err(ChronicleError::Runtime(
+            "array index must be a non-negative i64".into(),
+        )),
     }
 }
 
@@ -656,10 +1248,7 @@ fn builtin_capability(name: &str, args: &[Value]) -> Result<Value> {
         "log.print" => {
             println!(
                 "{}",
-                args.iter()
-                    .map(display_value)
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                args.iter().map(display_value).collect::<Vec<_>>().join(" ")
             );
             Ok(Value::Nil)
         }
@@ -673,7 +1262,9 @@ fn builtin_capability(name: &str, args: &[Value]) -> Result<Value> {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|err| ChronicleError::Capability(err.to_string()))?;
-            Ok(Value::I64((now.as_nanos() as u64 ^ 0x9E37_79B9_7F4A_7C15) as i64))
+            Ok(Value::I64(
+                (now.as_nanos() as u64 ^ 0x9E37_79B9_7F4A_7C15) as i64,
+            ))
         }
         other => Err(ChronicleError::Capability(format!(
             "unknown built-in capability {other}"
@@ -713,7 +1304,10 @@ mod tests {
                 name: "main".into(),
                 registers: 1,
                 arity: 0,
-                code: vec![Instruction::Const { dst: 2, constant: 0 }],
+                code: vec![Instruction::Const {
+                    dst: 2,
+                    constant: 0,
+                }],
                 source_lines: vec![Some(1)],
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
@@ -819,7 +1413,10 @@ mod tests {
                 registers: 1,
                 arity: 0,
                 code: vec![
-                    Instruction::Const { dst: 0, constant: 0 },
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
                     Instruction::Ret { src: 0 },
                 ],
                 source_lines: vec![Some(1), Some(2)],
@@ -830,5 +1427,68 @@ mod tests {
         let mut trace = vm.run_with_trace("main").unwrap();
         trace.events[0].opcode = "changed".into();
         assert!(Vm::replay(trace).is_err());
+    }
+
+    #[test]
+    fn binary_module_round_trips() {
+        let module = Module {
+            name: "roundtrip".into(),
+            constants: vec![
+                Value::I64(7),
+                Value::String("value".into()),
+                Value::Array(vec![Value::Bool(true), Value::Nil]),
+            ],
+            capabilities: vec![CapabilityDecl {
+                name: "log.print".into(),
+                reason: Some("test".into()),
+            }],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 3,
+                arity: 0,
+                code: vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 1,
+                    },
+                    Instruction::CapCall {
+                        dst: 2,
+                        capability: "log.print".into(),
+                        args: vec![1],
+                    },
+                    Instruction::Ret { src: 0 },
+                ],
+                source_lines: vec![Some(10), Some(11), Some(12), Some(13)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let bytes = module.to_bytes().unwrap();
+        assert!(bytes.starts_with(MODULE_MAGIC));
+        let decoded = Module::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, module);
+        Verifier::verify(&decoded).unwrap();
+    }
+
+    #[test]
+    fn json_module_decode_remains_supported() {
+        let module = Module {
+            name: "json".into(),
+            constants: vec![],
+            capabilities: vec![],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 1,
+                arity: 0,
+                code: vec![Instruction::Ret { src: 0 }],
+                source_lines: vec![Some(1)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let json = module.to_json_bytes().unwrap();
+        assert_eq!(Module::from_bytes(&json).unwrap(), module);
     }
 }
