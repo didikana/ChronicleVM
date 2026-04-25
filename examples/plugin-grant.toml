@@ -1,4 +1,8 @@
-[capabilities]
-"log.print" = "grant"
-"clock.now" = "grant"
-"random.u64" = "grant"
+[capabilities."log.print@1"]
+decision = "grant"
+
+[capabilities."clock.now@1"]
+decision = "grant"
+
+[capabilities."random.u64@1"]
+decision = "grant"

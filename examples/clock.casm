@@ -1,12 +1,12 @@
 .module "clock-demo"
-.cap clock.now reason="deterministic timestamp"
-.cap random.u64 reason="deterministic random value"
-.cap log.print reason="debug output"
+.cap clock.now@1() -> i64 reason="deterministic timestamp"
+.cap random.u64@1() -> i64 reason="deterministic random value"
+.cap log.print@1(any...) -> nil reason="debug output"
 
 .fn main r5
-  cap_call r0, clock.now
-  cap_call r1, random.u64
+  cap_call r0, clock.now@1
+  cap_call r1, random.u64@1
   array_new r2, r0, r1
-  cap_call r3, log.print, r0, r1
+  cap_call r3, log.print@1, r0, r1
   ret r2
 .end

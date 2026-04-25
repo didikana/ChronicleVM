@@ -1,15 +1,13 @@
-.module "safe-plugin"
+.module "bench-plugin"
 .cap log.print@1(any...) -> nil reason="emit audit line"
 .cap clock.now@1() -> i64 reason="timestamp plugin execution"
 .cap random.u64@1() -> i64 reason="generate deterministic request id"
 
-.fn main r7
+.fn main r5
   const r0, "plugin started"
   cap_call r1, log.print@1, r0
   cap_call r2, clock.now@1
   cap_call r3, random.u64@1
   array_new r4, r2, r3
-  const r5, "plugin finished"
-  cap_call r6, log.print@1, r5
   ret r4
 .end

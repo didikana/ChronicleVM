@@ -1,4 +1,4 @@
-use chronicle_core::{CapabilityDecl, Function, Instruction, Module, Value, Verifier};
+use chronicle_core::{CapabilityDecl, Function, Instruction, Module, Value, ValueType, Verifier};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -164,7 +164,7 @@ impl FunctionCompiler {
             next_register: 0,
             code: Vec::new(),
             source_lines: Vec::new(),
-            declared_caps: capabilities.iter().map(|cap| cap.name.clone()).collect(),
+            declared_caps: capabilities.iter().map(|cap| cap.id.clone()).collect(),
         }
     }
 
@@ -384,28 +384,75 @@ fn parse_cap_call(line_no: usize, input: &str) -> Result<Expr> {
 }
 
 fn parse_capability(line_no: usize, input: &str) -> Result<CapabilityDecl> {
-    let mut parts = input.splitn(2, char::is_whitespace);
-    let name = parts
-        .next()
-        .ok_or_else(|| err(line_no, "cap expects a capability name"))?;
-    validate_cap_name(line_no, name)?;
-    let reason = parts
+    let (signature, tail) = input
+        .split_once("->")
+        .ok_or_else(|| err(line_no, "cap expects id(params) -> return_type"))?;
+    let open = signature
+        .find('(')
+        .ok_or_else(|| err(line_no, "cap signature expects id(params)"))?;
+    let close = signature
+        .rfind(')')
+        .ok_or_else(|| err(line_no, "cap signature missing ')'"))?;
+    let id = signature[..open].trim();
+    validate_cap_name(line_no, id)?;
+    let params = split_args(line_no, &signature[open + 1..close])?
+        .into_iter()
+        .map(|value| parse_value_type(line_no, &value))
+        .collect::<Result<Vec<_>>>()?;
+    let mut tail_parts = tail.trim().splitn(2, char::is_whitespace);
+    let return_type = parse_value_type(
+        line_no,
+        tail_parts
+            .next()
+            .ok_or_else(|| err(line_no, "cap expects return type"))?,
+    )?;
+    let reason = tail_parts
         .next()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| parse_quoted(line_no, value))
         .transpose()?;
     Ok(CapabilityDecl {
-        name: name.to_string(),
+        id: id.to_string(),
+        params,
+        return_type,
         reason,
     })
+}
+
+fn parse_value_type(line_no: usize, input: &str) -> Result<ValueType> {
+    match input.trim() {
+        "nil" => Ok(ValueType::Nil),
+        "bool" => Ok(ValueType::Bool),
+        "i64" => Ok(ValueType::I64),
+        "f64" => Ok(ValueType::F64),
+        "string" => Ok(ValueType::String),
+        "array" => Ok(ValueType::Array),
+        "function" => Ok(ValueType::Function),
+        "capability" => Ok(ValueType::Capability),
+        "any" => Ok(ValueType::Any),
+        "any..." => Ok(ValueType::AnyVariadic),
+        other => Err(err(line_no, format!("unknown value type {other}"))),
+    }
 }
 
 fn render_casm(module: &Module) -> String {
     let mut out = String::new();
     out.push_str(&format!(".module \"{}\"\n", escape_string(&module.name)));
     for capability in &module.capabilities {
-        out.push_str(&format!(".cap {}", capability.name));
+        out.push_str(&format!(".cap {}(", capability.id));
+        out.push_str(
+            &capability
+                .params
+                .iter()
+                .map(render_value_type)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push_str(&format!(
+            ") -> {}",
+            render_value_type(&capability.return_type)
+        ));
         if let Some(reason) = &capability.reason {
             out.push_str(&format!(" reason=\"{}\"", escape_string(reason)));
         }
@@ -422,6 +469,22 @@ fn render_casm(module: &Module) -> String {
     }
     out.push_str(".end\n");
     out
+}
+
+fn render_value_type(value_type: &ValueType) -> String {
+    match value_type {
+        ValueType::Nil => "nil",
+        ValueType::Bool => "bool",
+        ValueType::I64 => "i64",
+        ValueType::F64 => "f64",
+        ValueType::String => "string",
+        ValueType::Array => "array",
+        ValueType::Function => "function",
+        ValueType::Capability => "capability",
+        ValueType::Any => "any",
+        ValueType::AnyVariadic => "any...",
+    }
+    .into()
 }
 
 fn render_instruction(instruction: &Instruction, constants: &[Value]) -> String {
@@ -586,9 +649,9 @@ fn validate_ident(line_no: usize, input: &str) -> Result<()> {
 
 fn validate_cap_name(line_no: usize, input: &str) -> Result<()> {
     if input.is_empty()
-        || !input
-            .chars()
-            .all(|ch| ch == '.' || ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
+        || !input.chars().all(|ch| {
+            ch == '.' || ch == '@' || ch == '_' || ch == '-' || ch.is_ascii_alphanumeric()
+        })
     {
         return Err(err(line_no, format!("invalid capability name {input}")));
     }
@@ -630,22 +693,22 @@ mod tests {
     fn compiles_plugin_language_to_module_and_casm() {
         let source = r#"
           module safe_plugin
-          cap log.print "audit"
-          cap clock.now "time"
-          cap random.u64 "request id"
+          cap log.print@1(any...) -> nil "audit"
+          cap clock.now@1() -> i64 "time"
+          cap random.u64@1() -> i64 "request id"
 
           fn main
             let started = "plugin started"
-            cap log.print(started)
-            let now = cap clock.now()
-            let request = cap random.u64()
+            cap log.print@1(started)
+            let now = cap clock.now@1()
+            let request = cap random.u64@1()
             let result = [now, request]
             return result
           end
         "#;
         let compiled = Compiler::compile(source).unwrap();
         assert_eq!(compiled.module.name, "safe_plugin");
-        assert!(compiled.casm.contains(".cap log.print"));
+        assert!(compiled.casm.contains(".cap log.print@1"));
         assert_eq!(
             compiled.module.functions[0].source_lines.len(),
             compiled.module.functions[0].code.len()
@@ -657,7 +720,7 @@ mod tests {
         let source = r#"
           module bad
           fn main
-            cap log.print("hello")
+            cap log.print@1("hello")
           end
         "#;
         assert!(Compiler::compile(source).is_err());

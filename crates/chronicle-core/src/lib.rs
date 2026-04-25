@@ -1,22 +1,23 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const MODULE_MAGIC: &[u8; 8] = b"CHVMOD1\0";
+pub const MODULE_MAGIC: &[u8; 8] = b"CHVMOD2\0";
+const OLD_MODULE_MAGIC: &[u8; 8] = b"CHVMOD1\0";
 
 #[derive(Debug, Error)]
 pub enum ChronicleError {
     #[error("decode error: {0}")]
     Decode(String),
     #[error("verify error: {0}")]
-    Verify(String),
-    #[error("capability error: {0}")]
-    Capability(String),
+    Verify(#[from] VerifyError),
+    #[error("policy error: {0}")]
+    Policy(#[from] PolicyError),
     #[error("runtime error: {0}")]
     Runtime(String),
-    #[error("replay divergence: {0}")]
-    Replay(String),
+    #[error("replay error: {0}")]
+    Replay(#[from] ReplayError),
 }
 
 pub type Result<T> = std::result::Result<T, ChronicleError>;
@@ -34,6 +35,19 @@ pub enum Value {
 }
 
 impl Value {
+    pub fn value_type(&self) -> ValueType {
+        match self {
+            Value::Nil => ValueType::Nil,
+            Value::Bool(_) => ValueType::Bool,
+            Value::I64(_) => ValueType::I64,
+            Value::F64(_) => ValueType::F64,
+            Value::String(_) => ValueType::String,
+            Value::Array(_) => ValueType::Array,
+            Value::Function(_) => ValueType::Function,
+            Value::Capability(_) => ValueType::Capability,
+        }
+    }
+
     fn truthy(&self) -> bool {
         match self {
             Value::Nil => false,
@@ -48,10 +62,148 @@ impl Value {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueType {
+    Nil,
+    Bool,
+    I64,
+    F64,
+    String,
+    Array,
+    Function,
+    Capability,
+    Any,
+    AnyVariadic,
+}
+
+impl ValueType {
+    pub fn accepts(&self, value: &Value) -> bool {
+        match self {
+            ValueType::Any | ValueType::AnyVariadic => true,
+            expected => *expected == value.value_type(),
+        }
+    }
+
+    fn accepts_type(&self, actual: &ValueType) -> bool {
+        matches!(self, ValueType::Any | ValueType::AnyVariadic) || self == actual
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityDecl {
-    pub name: String,
+    pub id: String,
+    pub params: Vec<ValueType>,
+    pub return_type: ValueType,
     pub reason: Option<String>,
 }
+
+impl CapabilityDecl {
+    pub fn is_variadic(&self) -> bool {
+        matches!(self.params.last(), Some(ValueType::AnyVariadic))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyErrorKind {
+    MalformedModule,
+    UnsupportedBytecodeVersion,
+    DuplicateSymbol,
+    RegisterOutOfBounds,
+    ConstantOutOfBounds,
+    InvalidJumpTarget,
+    MissingExport,
+    MissingCallee,
+    ArityMismatch,
+    UndeclaredCapability,
+    CapabilitySignatureMismatch,
+    SourceMapMismatch,
+    TypeMismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VerifyError {
+    pub kind: VerifyErrorKind,
+    pub message: String,
+    pub function: Option<String>,
+    pub pc: Option<usize>,
+}
+
+impl VerifyError {
+    pub fn new(kind: VerifyErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            function: None,
+            pc: None,
+        }
+    }
+
+    fn at(mut self, function: &Function, pc: usize) -> Self {
+        self.function = Some(function.name.clone());
+        self.pc = Some(pc);
+        self
+    }
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let (Some(function), Some(pc)) = (&self.function, self.pc) {
+            write!(
+                formatter,
+                "{:?} at {function} pc={pc}: {}",
+                self.kind, self.message
+            )
+        } else {
+            write!(formatter, "{:?}: {}", self.kind, self.message)
+        }
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyErrorKind {
+    MissingPolicy,
+    DeniedCapability,
+    MockTypeMismatch,
+    UnknownDecision,
+    UnsupportedCapabilityVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyError {
+    pub kind: PolicyErrorKind,
+    pub capability: String,
+    pub message: String,
+}
+
+impl PolicyError {
+    pub fn new(
+        kind: PolicyErrorKind,
+        capability: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            capability: capability.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{:?} for {}: {}",
+            self.kind, self.capability, self.message
+        )
+    }
+}
+
+impl std::error::Error for PolicyError {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Module {
@@ -66,6 +218,11 @@ impl Module {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.starts_with(MODULE_MAGIC) {
             BinaryModuleReader::new(bytes).read_module()
+        } else if bytes.starts_with(OLD_MODULE_MAGIC) {
+            Err(ChronicleError::Verify(VerifyError::new(
+                VerifyErrorKind::UnsupportedBytecodeVersion,
+                "CHVMOD1 modules are not supported by this runtime; reassemble as CHVMOD2",
+            )))
         } else {
             serde_json::from_slice(bytes).map_err(|err| ChronicleError::Decode(err.to_string()))
         }
@@ -212,7 +369,12 @@ impl BinaryModuleWriter {
         }
         self.write_len(module.capabilities.len())?;
         for capability in &module.capabilities {
-            self.write_string(&capability.name)?;
+            self.write_string(&capability.id)?;
+            self.write_len(capability.params.len())?;
+            for param in &capability.params {
+                self.write_value_type(param);
+            }
+            self.write_value_type(&capability.return_type);
             self.write_optional_string(capability.reason.as_deref())?;
         }
         self.write_len(module.functions.len())?;
@@ -365,6 +527,21 @@ impl BinaryModuleWriter {
         Ok(())
     }
 
+    fn write_value_type(&mut self, value_type: &ValueType) {
+        self.write_u8(match value_type {
+            ValueType::Nil => 0,
+            ValueType::Bool => 1,
+            ValueType::I64 => 2,
+            ValueType::F64 => 3,
+            ValueType::String => 4,
+            ValueType::Array => 5,
+            ValueType::Function => 6,
+            ValueType::Capability => 7,
+            ValueType::Any => 8,
+            ValueType::AnyVariadic => 9,
+        });
+    }
+
     fn write_optional_string(&mut self, value: Option<&str>) -> Result<()> {
         match value {
             Some(value) => {
@@ -421,8 +598,13 @@ impl<'a> BinaryModuleReader<'a> {
         let name = self.read_string()?;
         let constants = self.read_many(Self::read_value)?;
         let capabilities = self.read_many(|reader| {
+            let id = reader.read_string()?;
+            let params = reader.read_many(Self::read_value_type)?;
+            let return_type = reader.read_value_type()?;
             Ok(CapabilityDecl {
-                name: reader.read_string()?,
+                id,
+                params,
+                return_type,
                 reason: reader.read_optional_string()?,
             })
         })?;
@@ -551,6 +733,26 @@ impl<'a> BinaryModuleReader<'a> {
         })
     }
 
+    fn read_value_type(&mut self) -> Result<ValueType> {
+        Ok(match self.read_u8()? {
+            0 => ValueType::Nil,
+            1 => ValueType::Bool,
+            2 => ValueType::I64,
+            3 => ValueType::F64,
+            4 => ValueType::String,
+            5 => ValueType::Array,
+            6 => ValueType::Function,
+            7 => ValueType::Capability,
+            8 => ValueType::Any,
+            9 => ValueType::AnyVariadic,
+            tag => {
+                return Err(ChronicleError::Decode(format!(
+                    "unknown value type tag {tag}"
+                )))
+            }
+        })
+    }
+
     fn read_optional_string(&mut self) -> Result<Option<String>> {
         Ok(match self.read_u8()? {
             0 => None,
@@ -621,37 +823,68 @@ pub struct Verifier;
 
 impl Verifier {
     pub fn verify(module: &Module) -> Result<()> {
+        let mut capability_ids = BTreeSet::new();
+        for capability in &module.capabilities {
+            if !capability_ids.insert(capability.id.clone()) {
+                return Err(VerifyError::new(
+                    VerifyErrorKind::DuplicateSymbol,
+                    format!("duplicate capability {}", capability.id),
+                )
+                .into());
+            }
+            validate_capability_decl(capability)?;
+        }
+        let mut function_names = BTreeSet::new();
+        for function in &module.functions {
+            if !function_names.insert(function.name.clone()) {
+                return Err(VerifyError::new(
+                    VerifyErrorKind::DuplicateSymbol,
+                    format!("duplicate function {}", function.name),
+                )
+                .into());
+            }
+        }
+
         for (export, index) in &module.exports {
             if *index >= module.functions.len() {
-                return Err(ChronicleError::Verify(format!(
-                    "export {export} points to missing function {index}"
-                )));
+                return Err(VerifyError::new(
+                    VerifyErrorKind::MissingExport,
+                    format!("export {export} points to missing function {index}"),
+                )
+                .into());
             }
         }
 
         for function in &module.functions {
             if function.registers == 0 {
-                return Err(ChronicleError::Verify(format!(
-                    "function {} must have at least one register",
-                    function.name
-                )));
+                return Err(VerifyError::new(
+                    VerifyErrorKind::MalformedModule,
+                    format!("function {} must have at least one register", function.name),
+                )
+                .into());
             }
             if function.arity > function.registers {
-                return Err(ChronicleError::Verify(format!(
-                    "function {} arity exceeds register count",
-                    function.name
-                )));
+                return Err(VerifyError::new(
+                    VerifyErrorKind::ArityMismatch,
+                    format!("function {} arity exceeds register count", function.name),
+                )
+                .into());
             }
             if !function.source_lines.is_empty()
                 && function.source_lines.len() != function.code.len()
             {
-                return Err(ChronicleError::Verify(format!(
-                    "function {} source line map length does not match code length",
-                    function.name
-                )));
+                return Err(VerifyError::new(
+                    VerifyErrorKind::SourceMapMismatch,
+                    format!(
+                        "function {} source line map length does not match code length",
+                        function.name
+                    ),
+                )
+                .into());
             }
+            let mut register_types = vec![None; function.registers];
             for (pc, instruction) in function.code.iter().enumerate() {
-                verify_instruction(module, function, pc, instruction)?;
+                verify_instruction(module, function, pc, instruction, &mut register_types)?;
             }
         }
 
@@ -664,23 +897,28 @@ fn verify_instruction(
     function: &Function,
     pc: usize,
     instruction: &Instruction,
+    register_types: &mut [Option<ValueType>],
 ) -> Result<()> {
     let reg = |register: usize| -> Result<()> {
         if register >= function.registers {
-            Err(ChronicleError::Verify(format!(
-                "{} pc {pc}: register r{register} out of bounds",
-                function.name
-            )))
+            Err(VerifyError::new(
+                VerifyErrorKind::RegisterOutOfBounds,
+                format!("register r{register} out of bounds"),
+            )
+            .at(function, pc)
+            .into())
         } else {
             Ok(())
         }
     };
     let target = |target: usize| -> Result<()> {
         if target >= function.code.len() {
-            Err(ChronicleError::Verify(format!(
-                "{} pc {pc}: jump target {target} out of bounds",
-                function.name
-            )))
+            Err(VerifyError::new(
+                VerifyErrorKind::InvalidJumpTarget,
+                format!("jump target {target} out of bounds"),
+            )
+            .at(function, pc)
+            .into())
         } else {
             Ok(())
         }
@@ -690,15 +928,19 @@ fn verify_instruction(
         Instruction::Const { dst, constant } => {
             reg(*dst)?;
             if *constant >= module.constants.len() {
-                return Err(ChronicleError::Verify(format!(
-                    "{} pc {pc}: constant {constant} out of bounds",
-                    function.name
-                )));
+                return Err(VerifyError::new(
+                    VerifyErrorKind::ConstantOutOfBounds,
+                    format!("constant {constant} out of bounds"),
+                )
+                .at(function, pc)
+                .into());
             }
+            register_types[*dst] = Some(module.constants[*constant].value_type());
         }
         Instruction::Move { dst, src } => {
             reg(*dst)?;
             reg(*src)?;
+            register_types[*dst] = register_types[*src].clone();
         }
         Instruction::Add { dst, lhs, rhs }
         | Instruction::Sub { dst, lhs, rhs }
@@ -709,6 +951,11 @@ fn verify_instruction(
             reg(*dst)?;
             reg(*lhs)?;
             reg(*rhs)?;
+            let result_type = match instruction {
+                Instruction::Eq { .. } | Instruction::Lt { .. } => ValueType::Bool,
+                _ => ValueType::I64,
+            };
+            register_types[*dst] = Some(result_type);
         }
         Instruction::Jump {
             target: jump_target,
@@ -730,19 +977,26 @@ fn verify_instruction(
                 reg(*arg)?;
             }
             let Some(callee_index) = module.function_index(callee) else {
-                return Err(ChronicleError::Verify(format!(
-                    "{} pc {pc}: missing callee {callee}",
-                    function.name
-                )));
+                return Err(VerifyError::new(
+                    VerifyErrorKind::MissingCallee,
+                    format!("missing callee {callee}"),
+                )
+                .at(function, pc)
+                .into());
             };
             if module.functions[callee_index].arity != args.len() {
-                return Err(ChronicleError::Verify(format!(
-                    "{} pc {pc}: callee {callee} expects {} args, got {}",
-                    function.name,
-                    module.functions[callee_index].arity,
-                    args.len()
-                )));
+                return Err(VerifyError::new(
+                    VerifyErrorKind::ArityMismatch,
+                    format!(
+                        "callee {callee} expects {} args, got {}",
+                        module.functions[callee_index].arity,
+                        args.len()
+                    ),
+                )
+                .at(function, pc)
+                .into());
             }
+            register_types[*dst] = None;
         }
         Instruction::Ret { src } => reg(*src)?,
         Instruction::CapCall {
@@ -754,27 +1008,33 @@ fn verify_instruction(
             for arg in args {
                 reg(*arg)?;
             }
-            if !module
+            let Some(decl) = module
                 .capabilities
                 .iter()
-                .any(|decl| decl.name == *capability)
-            {
-                return Err(ChronicleError::Verify(format!(
-                    "{} pc {pc}: capability {capability} was not declared",
-                    function.name
-                )));
-            }
+                .find(|decl| decl.id == *capability)
+            else {
+                return Err(VerifyError::new(
+                    VerifyErrorKind::UndeclaredCapability,
+                    format!("capability {capability} was not declared"),
+                )
+                .at(function, pc)
+                .into());
+            };
+            verify_capability_args(function, pc, decl, args, register_types)?;
+            register_types[*dst] = Some(decl.return_type.clone());
         }
         Instruction::ArrayNew { dst, items } => {
             reg(*dst)?;
             for item in items {
                 reg(*item)?;
             }
+            register_types[*dst] = Some(ValueType::Array);
         }
         Instruction::ArrayGet { dst, array, index } => {
             reg(*dst)?;
             reg(*array)?;
             reg(*index)?;
+            register_types[*dst] = None;
         }
         Instruction::ArraySet {
             array,
@@ -787,6 +1047,98 @@ fn verify_instruction(
         }
     }
 
+    Ok(())
+}
+
+fn validate_capability_decl(decl: &CapabilityDecl) -> Result<()> {
+    if decl.id.is_empty() || !decl.id.contains('@') {
+        return Err(VerifyError::new(
+            VerifyErrorKind::CapabilitySignatureMismatch,
+            format!(
+                "capability {} must include a version suffix like @1",
+                decl.id
+            ),
+        )
+        .into());
+    }
+    if decl
+        .params
+        .iter()
+        .take(decl.params.len().saturating_sub(1))
+        .any(|param| matches!(param, ValueType::AnyVariadic))
+    {
+        return Err(VerifyError::new(
+            VerifyErrorKind::CapabilitySignatureMismatch,
+            format!(
+                "capability {} has variadic marker before final parameter",
+                decl.id
+            ),
+        )
+        .into());
+    }
+    if let Some(expected) = builtin_signature(&decl.id) {
+        if expected.params != decl.params || expected.return_type != decl.return_type {
+            return Err(VerifyError::new(
+                VerifyErrorKind::CapabilitySignatureMismatch,
+                format!("capability {} does not match built-in signature", decl.id),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_capability_args(
+    function: &Function,
+    pc: usize,
+    decl: &CapabilityDecl,
+    args: &[usize],
+    register_types: &[Option<ValueType>],
+) -> Result<()> {
+    let fixed = if decl.is_variadic() {
+        decl.params.len() - 1
+    } else {
+        decl.params.len()
+    };
+    let arity_ok = if decl.is_variadic() {
+        args.len() >= fixed
+    } else {
+        args.len() == fixed
+    };
+    if !arity_ok {
+        return Err(VerifyError::new(
+            VerifyErrorKind::ArityMismatch,
+            format!(
+                "capability {} expects {}{} args, got {}",
+                decl.id,
+                fixed,
+                if decl.is_variadic() { "+" } else { "" },
+                args.len()
+            ),
+        )
+        .at(function, pc)
+        .into());
+    }
+    for (index, register) in args.iter().enumerate() {
+        let expected = if index < decl.params.len() {
+            &decl.params[index]
+        } else {
+            decl.params.last().unwrap_or(&ValueType::Any)
+        };
+        if let Some(actual) = &register_types[*register] {
+            if !expected.accepts_type(actual) {
+                return Err(VerifyError::new(
+                    VerifyErrorKind::TypeMismatch,
+                    format!(
+                        "capability {} arg {index} expects {:?}, got {:?}",
+                        decl.id, expected, actual
+                    ),
+                )
+                .at(function, pc)
+                .into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -804,12 +1156,110 @@ pub struct HostPolicy {
 }
 
 impl HostPolicy {
-    pub fn decision_for(&self, capability: &str) -> CapabilityDecision {
-        self.decisions
-            .get(capability)
-            .cloned()
-            .unwrap_or(CapabilityDecision::Deny)
+    pub fn negotiate(&self, module: &Module) -> NegotiationReport {
+        let mut entries = Vec::new();
+        for decl in &module.capabilities {
+            let decision = self
+                .decisions
+                .get(&decl.id)
+                .cloned()
+                .unwrap_or(CapabilityDecision::Deny);
+            let status = match &decision {
+                CapabilityDecision::Grant => {
+                    if builtin_signature(&decl.id).is_some() || !is_builtin_namespace(&decl.id) {
+                        NegotiationStatus::Granted
+                    } else {
+                        NegotiationStatus::Unknown
+                    }
+                }
+                CapabilityDecision::Mock(value) => {
+                    if !decl.return_type.accepts(value) {
+                        NegotiationStatus::TypeInvalid
+                    } else {
+                        NegotiationStatus::Mocked
+                    }
+                }
+                CapabilityDecision::Deny => NegotiationStatus::Denied,
+            };
+            entries.push(NegotiationEntry {
+                capability: decl.id.clone(),
+                decision,
+                status,
+                reason: decl.reason.clone(),
+            });
+        }
+        NegotiationReport { entries }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NegotiationReport {
+    pub entries: Vec<NegotiationEntry>,
+}
+
+impl NegotiationReport {
+    pub fn is_success(&self) -> bool {
+        self.entries.iter().all(|entry| {
+            matches!(
+                entry.status,
+                NegotiationStatus::Granted | NegotiationStatus::Mocked
+            )
+        })
+    }
+
+    pub fn into_capability_table(self) -> Result<BTreeMap<String, CapabilityDecision>> {
+        let mut capabilities = BTreeMap::new();
+        for entry in self.entries {
+            match entry.status {
+                NegotiationStatus::Granted | NegotiationStatus::Mocked => {
+                    capabilities.insert(entry.capability, entry.decision);
+                }
+                NegotiationStatus::Denied => {
+                    return Err(PolicyError::new(
+                        PolicyErrorKind::DeniedCapability,
+                        entry.capability,
+                        "capability denied by policy or missing from policy",
+                    )
+                    .into());
+                }
+                NegotiationStatus::Unknown => {
+                    return Err(PolicyError::new(
+                        PolicyErrorKind::UnsupportedCapabilityVersion,
+                        entry.capability,
+                        "unknown built-in capability/version",
+                    )
+                    .into());
+                }
+                NegotiationStatus::TypeInvalid => {
+                    return Err(PolicyError::new(
+                        PolicyErrorKind::MockTypeMismatch,
+                        entry.capability,
+                        "mock value does not match declared return type",
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(capabilities)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NegotiationEntry {
+    pub capability: String,
+    pub decision: CapabilityDecision,
+    pub status: NegotiationStatus,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NegotiationStatus {
+    Granted,
+    Mocked,
+    Denied,
+    Unknown,
+    TypeInvalid,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -819,6 +1269,7 @@ pub struct Trace {
     pub events: Vec<TraceEvent>,
     pub result: Option<Value>,
     pub error: Option<String>,
+    pub checksum: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -830,6 +1281,7 @@ pub struct TraceEvent {
     pub register_changes: Vec<RegisterChange>,
     pub capability: Option<CapabilityTrace>,
     pub error: Option<String>,
+    pub checksum: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -840,18 +1292,65 @@ pub struct RegisterChange {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityTrace {
-    pub name: String,
+    pub id: String,
+    pub decision: CapabilityTraceDecision,
     pub args: Vec<Value>,
     pub result: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityTraceDecision {
+    Granted,
+    Mocked,
+    Replayed,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReplayReport {
     pub events_checked: usize,
     pub result: Option<Value>,
+    pub trace_checksum: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplayDiff {
+    pub index: usize,
+    pub expected: Option<TraceEvent>,
+    pub actual: Option<TraceEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplayError {
+    pub message: String,
+    pub diff: Option<ReplayDiff>,
+}
+
+impl ReplayError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            diff: None,
+        }
+    }
+
+    fn with_diff(message: impl Into<String>, diff: ReplayDiff) -> Self {
+        Self {
+            message: message.into(),
+            diff: Some(diff),
+        }
+    }
+}
+
+impl std::fmt::Display for ReplayError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ReplayError {}
+
+#[derive(Clone, Debug)]
 pub struct Vm {
     module: Module,
     capabilities: BTreeMap<String, CapabilityDecision>,
@@ -862,17 +1361,8 @@ pub struct Vm {
 impl Vm {
     pub fn new(module: Module, host_policy: HostPolicy) -> Result<Self> {
         Verifier::verify(&module)?;
-        let mut capabilities = BTreeMap::new();
-        for decl in &module.capabilities {
-            let decision = host_policy.decision_for(&decl.name);
-            if matches!(decision, CapabilityDecision::Deny) {
-                return Err(ChronicleError::Capability(format!(
-                    "capability {} denied",
-                    decl.name
-                )));
-            }
-            capabilities.insert(decl.name.clone(), decision);
-        }
+        let report = host_policy.negotiate(&module);
+        let capabilities = report.into_capability_table()?;
         Ok(Self {
             module,
             capabilities,
@@ -889,20 +1379,29 @@ impl Vm {
     pub fn run_with_trace(&mut self, entry: &str) -> Result<Trace> {
         let (result, events) = self.execute_collect(entry, true);
         match result {
-            Ok(result) => Ok(Trace {
-                module: self.module.clone(),
-                entry: entry.to_string(),
-                events,
-                result: Some(result),
-                error: None,
-            }),
-            Err(err) => Ok(Trace {
-                module: self.module.clone(),
-                entry: entry.to_string(),
-                events,
-                result: None,
-                error: Some(err.to_string()),
-            }),
+            Ok(result) => {
+                let checksum = trace_checksum(&events, &Some(result.clone()), &None);
+                Ok(Trace {
+                    module: self.module.clone(),
+                    entry: entry.to_string(),
+                    events,
+                    result: Some(result),
+                    error: None,
+                    checksum,
+                })
+            }
+            Err(err) => {
+                let error = err.to_string();
+                let checksum = trace_checksum(&events, &None, &Some(error.clone()));
+                Ok(Trace {
+                    module: self.module.clone(),
+                    entry: entry.to_string(),
+                    events,
+                    result: None,
+                    error: Some(error),
+                    checksum,
+                })
+            }
         }
     }
 
@@ -915,7 +1414,7 @@ impl Vm {
             .collect::<Vec<_>>();
         let mut capabilities = BTreeMap::new();
         for decl in &trace.module.capabilities {
-            capabilities.insert(decl.name.clone(), CapabilityDecision::Grant);
+            capabilities.insert(decl.id.clone(), CapabilityDecision::Grant);
         }
         let mut vm = Self {
             module: trace.module.clone(),
@@ -926,18 +1425,23 @@ impl Vm {
         let (result, events) = vm.execute_collect(&trace.entry, false);
         let result = result?;
         if events != trace.events {
-            return Err(ChronicleError::Replay(
-                "trace events did not match replay".into(),
-            ));
+            return Err(ReplayError::with_diff(
+                "trace events did not match replay",
+                first_replay_diff(&trace.events, &events),
+            )
+            .into());
         }
         if Some(result.clone()) != trace.result {
-            return Err(ChronicleError::Replay(
-                "trace result did not match replay".into(),
-            ));
+            return Err(ReplayError::new("trace result did not match replay").into());
+        }
+        let checksum = trace_checksum(&events, &Some(result.clone()), &None);
+        if checksum != trace.checksum {
+            return Err(ReplayError::new("trace checksum did not match replay").into());
         }
         Ok(ReplayReport {
             events_checked: events.len(),
             result: Some(result),
+            trace_checksum: checksum,
         })
     }
 
@@ -982,6 +1486,7 @@ impl Vm {
                 register_changes: Vec::new(),
                 capability: None,
                 error: None,
+                checksum: 0,
             };
             let mut next_pc = pc + 1;
             let step = self.apply_instruction(
@@ -995,15 +1500,18 @@ impl Vm {
             );
             match step {
                 Ok(Some(value)) => {
+                    seal_event(&mut event);
                     events.push(event);
                     return Ok(value);
                 }
                 Ok(None) => {
+                    seal_event(&mut event);
                     events.push(event);
                     pc = next_pc;
                 }
                 Err(err) => {
                     event.error = Some(err.to_string());
+                    seal_event(&mut event);
                     events.push(event);
                     return Err(err);
                 }
@@ -1121,7 +1629,8 @@ impl Vm {
                 let value =
                     self.call_capability(capability, call_args.clone(), live_capabilities)?;
                 event.capability = Some(CapabilityTrace {
-                    name: capability.clone(),
+                    id: capability.clone(),
+                    decision: self.capability_trace_decision(capability, live_capabilities),
                     args: call_args,
                     result: value.clone(),
                 });
@@ -1179,15 +1688,13 @@ impl Vm {
                 .get(self.replay_capability_index)
                 .cloned()
             else {
-                return Err(ChronicleError::Replay(format!(
-                    "missing recorded capability {name}"
-                )));
+                return Err(ReplayError::new(format!("missing recorded capability {name}")).into());
             };
             self.replay_capability_index += 1;
-            if recorded.name != name || recorded.args != args {
-                return Err(ChronicleError::Replay(format!(
-                    "capability call mismatch for {name}"
-                )));
+            if recorded.id != name || recorded.args != args {
+                return Err(
+                    ReplayError::new(format!("capability call mismatch for {name}")).into(),
+                );
             }
             return Ok(recorded.result);
         }
@@ -1195,9 +1702,29 @@ impl Vm {
         match self.capabilities.get(name) {
             Some(CapabilityDecision::Grant) => builtin_capability(name, &args),
             Some(CapabilityDecision::Mock(value)) => Ok(value.clone()),
-            Some(CapabilityDecision::Deny) | None => Err(ChronicleError::Capability(format!(
-                "capability {name} unavailable"
-            ))),
+            Some(CapabilityDecision::Deny) | None => Err(PolicyError::new(
+                PolicyErrorKind::DeniedCapability,
+                name,
+                "capability unavailable at runtime",
+            )
+            .into()),
+        }
+    }
+
+    fn capability_trace_decision(&self, name: &str, live: bool) -> CapabilityTraceDecision {
+        if !live {
+            self.replay_capabilities
+                .get(self.replay_capability_index.saturating_sub(1))
+                .filter(|recorded| recorded.id == name)
+                .map(|recorded| recorded.decision.clone())
+                .unwrap_or(CapabilityTraceDecision::Replayed)
+        } else if matches!(
+            self.capabilities.get(name),
+            Some(CapabilityDecision::Mock(_))
+        ) {
+            CapabilityTraceDecision::Mocked
+        } else {
+            CapabilityTraceDecision::Granted
         }
     }
 }
@@ -1207,6 +1734,45 @@ fn set_reg(registers: &mut [Value], event: &mut TraceEvent, register: usize, val
     event
         .register_changes
         .push(RegisterChange { register, value });
+}
+
+fn seal_event(event: &mut TraceEvent) {
+    event.checksum = 0;
+    event.checksum = stable_checksum(event);
+}
+
+fn trace_checksum(events: &[TraceEvent], result: &Option<Value>, error: &Option<String>) -> u64 {
+    stable_checksum(&(events, result, error))
+}
+
+fn stable_checksum<T: Serialize>(value: &T) -> u64 {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn first_replay_diff(expected: &[TraceEvent], actual: &[TraceEvent]) -> ReplayDiff {
+    let len = expected.len().max(actual.len());
+    for index in 0..len {
+        let expected_event = expected.get(index).cloned();
+        let actual_event = actual.get(index).cloned();
+        if expected_event != actual_event {
+            return ReplayDiff {
+                index,
+                expected: expected_event,
+                actual: actual_event,
+            };
+        }
+    }
+    ReplayDiff {
+        index: len,
+        expected: None,
+        actual: None,
+    }
 }
 
 fn numeric(
@@ -1245,31 +1811,62 @@ fn value_to_index(value: &Value) -> Result<usize> {
 
 fn builtin_capability(name: &str, args: &[Value]) -> Result<Value> {
     match name {
-        "log.print" => {
+        "log.print@1" => {
             println!(
                 "{}",
                 args.iter().map(display_value).collect::<Vec<_>>().join(" ")
             );
             Ok(Value::Nil)
         }
-        "clock.now" => {
+        "clock.now@1" => {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|err| ChronicleError::Capability(err.to_string()))?;
+                .map_err(|err| ChronicleError::Runtime(err.to_string()))?;
             Ok(Value::I64(now.as_secs() as i64))
         }
-        "random.u64" => {
+        "random.u64@1" => {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|err| ChronicleError::Capability(err.to_string()))?;
+                .map_err(|err| ChronicleError::Runtime(err.to_string()))?;
             Ok(Value::I64(
                 (now.as_nanos() as u64 ^ 0x9E37_79B9_7F4A_7C15) as i64,
             ))
         }
-        other => Err(ChronicleError::Capability(format!(
-            "unknown built-in capability {other}"
-        ))),
+        other => Err(PolicyError::new(
+            PolicyErrorKind::UnsupportedCapabilityVersion,
+            other,
+            "unknown built-in capability",
+        )
+        .into()),
     }
+}
+
+pub fn builtin_signature(id: &str) -> Option<CapabilityDecl> {
+    match id {
+        "log.print@1" => Some(CapabilityDecl {
+            id: id.into(),
+            params: vec![ValueType::AnyVariadic],
+            return_type: ValueType::Nil,
+            reason: None,
+        }),
+        "clock.now@1" => Some(CapabilityDecl {
+            id: id.into(),
+            params: vec![],
+            return_type: ValueType::I64,
+            reason: None,
+        }),
+        "random.u64@1" => Some(CapabilityDecl {
+            id: id.into(),
+            params: vec![],
+            return_type: ValueType::I64,
+            reason: None,
+        }),
+        _ => None,
+    }
+}
+
+fn is_builtin_namespace(id: &str) -> bool {
+    id.starts_with("log.") || id.starts_with("clock.") || id.starts_with("random.")
 }
 
 fn display_value(value: &Value) -> String {
@@ -1294,6 +1891,10 @@ mod tests {
         }
     }
 
+    fn cap(id: &str) -> CapabilityDecl {
+        builtin_signature(id).unwrap()
+    }
+
     #[test]
     fn verifies_register_bounds() {
         let module = Module {
@@ -1312,7 +1913,13 @@ mod tests {
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
         };
-        assert!(Verifier::verify(&module).is_err());
+        let err = Verifier::verify(&module).unwrap_err();
+        match err {
+            ChronicleError::Verify(err) => {
+                assert_eq!(err.kind, VerifyErrorKind::RegisterOutOfBounds)
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
     }
 
     #[test]
@@ -1320,10 +1927,7 @@ mod tests {
         let module = Module {
             name: "clock".into(),
             constants: vec![],
-            capabilities: vec![CapabilityDecl {
-                name: "clock.now".into(),
-                reason: None,
-            }],
+            capabilities: vec![cap("clock.now@1")],
             functions: vec![Function {
                 name: "main".into(),
                 registers: 1,
@@ -1331,7 +1935,7 @@ mod tests {
                 code: vec![
                     Instruction::CapCall {
                         dst: 0,
-                        capability: "clock.now".into(),
+                        capability: "clock.now@1".into(),
                         args: vec![],
                     },
                     Instruction::Ret { src: 0 },
@@ -1340,7 +1944,7 @@ mod tests {
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
         };
-        let mut vm = Vm::new(module, policy_grant("clock.now")).unwrap();
+        let mut vm = Vm::new(module, policy_grant("clock.now@1")).unwrap();
         let trace = vm.run_with_trace("main").unwrap();
         let report = Vm::replay(trace).unwrap();
         assert_eq!(report.events_checked, 2);
@@ -1351,10 +1955,7 @@ mod tests {
         let module = Module {
             name: "denied".into(),
             constants: vec![],
-            capabilities: vec![CapabilityDecl {
-                name: "log.print".into(),
-                reason: None,
-            }],
+            capabilities: vec![cap("log.print@1")],
             functions: vec![Function {
                 name: "main".into(),
                 registers: 1,
@@ -1372,10 +1973,7 @@ mod tests {
         let module = Module {
             name: "mock".into(),
             constants: vec![],
-            capabilities: vec![CapabilityDecl {
-                name: "random.u64".into(),
-                reason: None,
-            }],
+            capabilities: vec![cap("random.u64@1")],
             functions: vec![Function {
                 name: "main".into(),
                 registers: 1,
@@ -1383,7 +1981,7 @@ mod tests {
                 code: vec![
                     Instruction::CapCall {
                         dst: 0,
-                        capability: "random.u64".into(),
+                        capability: "random.u64@1".into(),
                         args: vec![],
                     },
                     Instruction::Ret { src: 0 },
@@ -1394,7 +1992,7 @@ mod tests {
         };
         let policy = HostPolicy {
             decisions: BTreeMap::from([(
-                "random.u64".into(),
+                "random.u64@1".into(),
                 CapabilityDecision::Mock(Value::I64(42)),
             )]),
         };
@@ -1426,7 +2024,11 @@ mod tests {
         let mut vm = Vm::new(module, HostPolicy::default()).unwrap();
         let mut trace = vm.run_with_trace("main").unwrap();
         trace.events[0].opcode = "changed".into();
-        assert!(Vm::replay(trace).is_err());
+        let err = Vm::replay(trace).unwrap_err();
+        match err {
+            ChronicleError::Replay(err) => assert_eq!(err.diff.unwrap().index, 0),
+            other => panic!("unexpected error {other:?}"),
+        }
     }
 
     #[test]
@@ -1439,8 +2041,8 @@ mod tests {
                 Value::Array(vec![Value::Bool(true), Value::Nil]),
             ],
             capabilities: vec![CapabilityDecl {
-                name: "log.print".into(),
                 reason: Some("test".into()),
+                ..cap("log.print@1")
             }],
             functions: vec![Function {
                 name: "main".into(),
@@ -1457,7 +2059,7 @@ mod tests {
                     },
                     Instruction::CapCall {
                         dst: 2,
-                        capability: "log.print".into(),
+                        capability: "log.print@1".into(),
                         args: vec![1],
                     },
                     Instruction::Ret { src: 0 },
@@ -1490,5 +2092,52 @@ mod tests {
         };
         let json = module.to_json_bytes().unwrap();
         assert_eq!(Module::from_bytes(&json).unwrap(), module);
+    }
+
+    #[test]
+    fn old_binary_version_is_rejected() {
+        let mut bytes = Vec::from(OLD_MODULE_MAGIC.as_slice());
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        let err = Module::from_bytes(&bytes).unwrap_err();
+        match err {
+            ChronicleError::Verify(err) => {
+                assert_eq!(err.kind, VerifyErrorKind::UnsupportedBytecodeVersion)
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_binary_is_rejected() {
+        let bytes = Vec::from(MODULE_MAGIC.as_slice());
+        assert!(Module::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn mock_type_mismatch_fails_negotiation() {
+        let module = Module {
+            name: "mock-type".into(),
+            constants: vec![],
+            capabilities: vec![cap("clock.now@1")],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 1,
+                arity: 0,
+                code: vec![Instruction::Ret { src: 0 }],
+                source_lines: vec![Some(1)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let policy = HostPolicy {
+            decisions: BTreeMap::from([(
+                "clock.now@1".into(),
+                CapabilityDecision::Mock(Value::String("bad".into())),
+            )]),
+        };
+        let err = Vm::new(module, policy).unwrap_err();
+        match err {
+            ChronicleError::Policy(err) => assert_eq!(err.kind, PolicyErrorKind::MockTypeMismatch),
+            other => panic!("unexpected error {other:?}"),
+        }
     }
 }

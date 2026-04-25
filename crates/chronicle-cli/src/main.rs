@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use chronicle_asm::Assembler;
-use chronicle_core::{CapabilityDecision, HostPolicy, Module, Trace, Value, Verifier, Vm};
+use chronicle_core::{
+    CapabilityDecision, ChronicleError, HostPolicy, Module, ReplayError, Trace, Value, Verifier, Vm,
+};
 use chronicle_lang::Compiler;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
@@ -33,6 +35,11 @@ enum Command {
     Verify {
         module: PathBuf,
     },
+    Negotiate {
+        module: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+    },
     Run {
         module: PathBuf,
         #[arg(long)]
@@ -51,6 +58,8 @@ enum Command {
     },
     Replay {
         trace: PathBuf,
+        #[arg(long)]
+        verbose: bool,
     },
     Inspect {
         trace: PathBuf,
@@ -90,6 +99,27 @@ fn main() -> Result<()> {
                 module.capabilities.len()
             );
         }
+        Command::Negotiate { module, policy } => {
+            let module = load_module(&module)?;
+            let policy = load_policy(&policy)?;
+            let report = policy.negotiate(&module);
+            for entry in &report.entries {
+                println!(
+                    "{} {:?} {:?}{}",
+                    entry.capability,
+                    entry.status,
+                    entry.decision,
+                    entry
+                        .reason
+                        .as_ref()
+                        .map(|reason| format!(" reason={reason}"))
+                        .unwrap_or_default()
+                );
+            }
+            if !report.is_success() {
+                anyhow::bail!("capability negotiation failed");
+            }
+        }
         Command::Run {
             module,
             policy,
@@ -117,18 +147,25 @@ fn main() -> Result<()> {
             }
             println!("wrote {}", out.display());
         }
-        Command::Replay { trace } => {
+        Command::Replay { trace, verbose } => {
             let trace = load_trace(&trace)?;
-            let report = Vm::replay(trace)?;
-            println!(
-                "replayed {} events, result {}",
-                report.events_checked,
-                report
-                    .result
-                    .as_ref()
-                    .map(render_value)
-                    .unwrap_or_else(|| "nil".into())
-            );
+            match Vm::replay(trace) {
+                Ok(report) => println!(
+                    "replayed {} events, checksum {}, result {}",
+                    report.events_checked,
+                    report.trace_checksum,
+                    report
+                        .result
+                        .as_ref()
+                        .map(render_value)
+                        .unwrap_or_else(|| "nil".into())
+                ),
+                Err(ChronicleError::Replay(error)) => {
+                    print_replay_error(&error, verbose);
+                    return Err(error.into());
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         Command::Inspect { trace } => {
             let trace = load_trace(&trace)?;
@@ -141,6 +178,8 @@ fn main() -> Result<()> {
             if let Some(error) = &trace.error {
                 println!("error: {error}");
             }
+            println!("checksum: {}", trace.checksum);
+            print_capability_audit(&trace);
             for event in &trace.events {
                 let source = event
                     .source_line
@@ -156,8 +195,9 @@ fn main() -> Result<()> {
                 );
                 if let Some(capability) = &event.capability {
                     println!(
-                        "  cap {} -> {}",
-                        capability.name,
+                        "  cap {} {:?} -> {}",
+                        capability.id,
+                        capability.decision,
                         render_value(&capability.result)
                     );
                 }
@@ -198,17 +238,13 @@ fn load_trace(path: &PathBuf) -> Result<Trace> {
 #[derive(Debug, Deserialize)]
 struct RawPolicy {
     #[serde(default)]
-    capabilities: BTreeMap<String, RawDecision>,
+    capabilities: BTreeMap<String, RawPolicyEntry>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RawDecision {
-    Text(String),
-    Table {
-        decision: Option<String>,
-        mock: Option<toml::Value>,
-    },
+struct RawPolicyEntry {
+    decision: String,
+    mock: Option<toml::Value>,
 }
 
 fn load_policy(path: &PathBuf) -> Result<HostPolicy> {
@@ -216,28 +252,22 @@ fn load_policy(path: &PathBuf) -> Result<HostPolicy> {
         .with_context(|| format!("failed to read policy {}", path.display()))?;
     let raw: RawPolicy = toml::from_str(&source).context("failed to parse policy TOML")?;
     let mut decisions = BTreeMap::new();
-    for (capability, decision) in raw.capabilities {
-        decisions.insert(capability, convert_decision(decision)?);
+    for (capability, entry) in raw.capabilities {
+        decisions.insert(capability, convert_decision(entry)?);
     }
     Ok(HostPolicy { decisions })
 }
 
-fn convert_decision(decision: RawDecision) -> Result<CapabilityDecision> {
-    match decision {
-        RawDecision::Text(value) if value == "grant" => Ok(CapabilityDecision::Grant),
-        RawDecision::Text(value) if value == "deny" => Ok(CapabilityDecision::Deny),
-        RawDecision::Text(value) => Err(anyhow!("unknown policy decision {value}")),
-        RawDecision::Table { decision, mock } => {
-            if let Some(mock) = mock {
-                return Ok(CapabilityDecision::Mock(toml_value_to_vm_value(mock)?));
-            }
-            match decision.as_deref() {
-                Some("grant") => Ok(CapabilityDecision::Grant),
-                Some("deny") => Ok(CapabilityDecision::Deny),
-                Some(value) => Err(anyhow!("unknown policy decision {value}")),
-                None => Err(anyhow!("policy table needs decision or mock")),
-            }
-        }
+fn convert_decision(entry: RawPolicyEntry) -> Result<CapabilityDecision> {
+    match entry.decision.as_str() {
+        "grant" => Ok(CapabilityDecision::Grant),
+        "deny" => Ok(CapabilityDecision::Deny),
+        "mock" => Ok(CapabilityDecision::Mock(toml_value_to_vm_value(
+            entry
+                .mock
+                .ok_or_else(|| anyhow!("mock decision needs mock value"))?,
+        )?)),
+        value => Err(anyhow!("unknown policy decision {value}")),
     }
 }
 
@@ -253,6 +283,57 @@ fn toml_value_to_vm_value(value: toml::Value) -> Result<Value> {
             .collect::<Result<Vec<_>>>()
             .map(Value::Array),
         other => Err(anyhow!("unsupported mock value {other:?}")),
+    }
+}
+
+fn print_capability_audit(trace: &Trace) {
+    let mut counts: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    for event in &trace.events {
+        if let Some(capability) = &event.capability {
+            let entry = counts.entry(capability.id.clone()).or_default();
+            entry.0 += 1;
+            match capability.decision {
+                chronicle_core::CapabilityTraceDecision::Granted => entry.1 += 1,
+                chronicle_core::CapabilityTraceDecision::Mocked => entry.2 += 1,
+                chronicle_core::CapabilityTraceDecision::Replayed => {}
+            }
+        }
+    }
+    if counts.is_empty() {
+        return;
+    }
+    println!("capability audit:");
+    for (id, (total, granted, mocked)) in counts {
+        println!("  {id}: calls={total} granted={granted} mocked={mocked}");
+    }
+}
+
+fn print_replay_error(error: &ReplayError, verbose: bool) {
+    eprintln!("replay failed: {}", error.message);
+    if let Some(diff) = &error.diff {
+        eprintln!("first divergence at event {}", diff.index);
+        if let Some(expected) = &diff.expected {
+            eprintln!(
+                "expected: {} pc={} line={:?} op={} checksum={}",
+                expected.function,
+                expected.pc,
+                expected.source_line,
+                expected.opcode,
+                expected.checksum
+            );
+            if verbose {
+                eprintln!("expected detail: {expected:#?}");
+            }
+        }
+        if let Some(actual) = &diff.actual {
+            eprintln!(
+                "actual:   {} pc={} line={:?} op={} checksum={}",
+                actual.function, actual.pc, actual.source_line, actual.opcode, actual.checksum
+            );
+            if verbose {
+                eprintln!("actual detail: {actual:#?}");
+            }
+        }
     }
 }
 

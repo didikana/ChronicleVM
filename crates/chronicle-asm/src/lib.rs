@@ -1,4 +1,4 @@
-use chronicle_core::{CapabilityDecl, Function, Instruction, Module, Value};
+use chronicle_core::{CapabilityDecl, Function, Instruction, Module, Value, ValueType};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -333,16 +333,52 @@ fn parse_function_header(line_no: usize, line: &str) -> Result<FunctionBuilder> 
 
 fn parse_capability(line_no: usize, line: &str) -> Result<CapabilityDecl> {
     let rest = line.trim_start_matches(".cap ").trim();
-    let mut parts = rest.split_whitespace();
-    let name = parts
+    let (signature, tail) = rest
+        .split_once("->")
+        .ok_or_else(|| err(line_no, ".cap expects signature -> return_type"))?;
+    let open = signature
+        .find('(')
+        .ok_or_else(|| err(line_no, ".cap signature expects id(params)"))?;
+    let close = signature
+        .rfind(')')
+        .ok_or_else(|| err(line_no, ".cap signature missing ')'"))?;
+    let id = signature[..open].trim().to_string();
+    let params = split_operands(line_no, &signature[open + 1..close])?
+        .into_iter()
+        .map(|value| parse_value_type(line_no, &value))
+        .collect::<Result<Vec<_>>>()?;
+    let return_token = tail
+        .split_whitespace()
         .next()
-        .ok_or_else(|| err(line_no, ".cap expects a capability name"))?
-        .to_string();
-    let reason = rest
+        .ok_or_else(|| err(line_no, ".cap expects return type"))?;
+    let return_type = parse_value_type(line_no, return_token)?;
+    let reason = tail
         .split_once("reason=")
         .map(|(_, value)| parse_quoted(line_no, value.trim()))
         .transpose()?;
-    Ok(CapabilityDecl { name, reason })
+    Ok(CapabilityDecl {
+        id,
+        params,
+        return_type,
+        reason,
+    })
+}
+
+fn parse_value_type(line_no: usize, token: &str) -> Result<ValueType> {
+    match token.trim() {
+        "" => Err(err(line_no, "empty value type")),
+        "nil" => Ok(ValueType::Nil),
+        "bool" => Ok(ValueType::Bool),
+        "i64" => Ok(ValueType::I64),
+        "f64" => Ok(ValueType::F64),
+        "string" => Ok(ValueType::String),
+        "array" => Ok(ValueType::Array),
+        "function" => Ok(ValueType::Function),
+        "capability" => Ok(ValueType::Capability),
+        "any" => Ok(ValueType::Any),
+        "any..." => Ok(ValueType::AnyVariadic),
+        other => Err(err(line_no, format!("unknown value type {other}"))),
+    }
 }
 
 fn parse_value(line_no: usize, token: &str) -> Result<Value> {
@@ -490,10 +526,10 @@ mod tests {
     fn parses_module_with_capability_and_label() {
         let source = r#"
           .module "demo"
-          .cap log.print reason="debug output"
+          .cap log.print@1(any...) -> nil reason="debug output"
           .fn main r3
             const r0, "hello"
-            cap_call r1, log.print, r0
+            cap_call r1, log.print@1, r0
           done:
             ret r1
           .end
@@ -501,7 +537,7 @@ mod tests {
         let module = Assembler::parse(source).unwrap();
         Verifier::verify(&module).unwrap();
         assert_eq!(module.name, "demo");
-        assert_eq!(module.capabilities[0].name, "log.print");
+        assert_eq!(module.capabilities[0].id, "log.print@1");
         assert!(module.exports.contains_key("main"));
     }
 
@@ -534,7 +570,7 @@ mod tests {
         let source = r#"
           .module "bad-cap"
           .fn main r2
-            cap_call r0, log.print
+            cap_call r0, log.print@1
             ret r0
           .end
         "#;

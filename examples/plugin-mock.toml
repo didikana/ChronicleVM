@@ -1,4 +1,10 @@
-[capabilities]
-"log.print" = "grant"
-"clock.now" = { mock = 1800000000 }
-"random.u64" = { mock = 9001 }
+[capabilities."log.print@1"]
+decision = "grant"
+
+[capabilities."clock.now@1"]
+decision = "mock"
+mock = 1800000000
+
+[capabilities."random.u64@1"]
+decision = "mock"
+mock = 9001

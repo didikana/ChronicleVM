@@ -1,0 +1,75 @@
+use std::path::PathBuf;
+use std::process::Command;
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+fn chronicle() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_chronicle"))
+}
+
+#[test]
+fn negotiate_reports_mocked_capabilities() {
+    let root = repo_root();
+    let output = chronicle()
+        .arg("negotiate")
+        .arg(root.join("examples/plugin.chr"))
+        .arg("--policy")
+        .arg(root.join("examples/plugin-mock.toml"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("clock.now@1 Mocked"));
+    assert!(stdout.contains("random.u64@1 Mocked"));
+}
+
+#[test]
+fn trace_inspect_and_replay_work() {
+    let root = repo_root();
+    let trace =
+        std::env::temp_dir().join(format!("chronicle-cli-test-{}.ctrace", std::process::id()));
+    let trace_output = chronicle()
+        .arg("trace")
+        .arg(root.join("examples/plugin.chr"))
+        .arg("--policy")
+        .arg(root.join("examples/plugin-mock.toml"))
+        .arg("--out")
+        .arg(&trace)
+        .output()
+        .unwrap();
+    assert!(trace_output.status.success());
+
+    let inspect = chronicle().arg("inspect").arg(&trace).output().unwrap();
+    assert!(inspect.status.success());
+    let inspect_stdout = String::from_utf8(inspect.stdout).unwrap();
+    assert!(inspect_stdout.contains("capability audit"));
+    assert!(inspect_stdout.contains("checksum:"));
+
+    let replay = chronicle().arg("replay").arg(&trace).output().unwrap();
+    assert!(replay.status.success());
+    let replay_stdout = String::from_utf8(replay.stdout).unwrap();
+    assert!(replay_stdout.contains("replayed 8 events"));
+    let _ = std::fs::remove_file(trace);
+}
+
+#[test]
+fn denied_policy_fails_negotiation() {
+    let root = repo_root();
+    let output = chronicle()
+        .arg("negotiate")
+        .arg(root.join("examples/plugin.chr"))
+        .arg("--policy")
+        .arg(root.join("examples/plugin-deny.toml"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("random.u64@1 Denied"));
+}
