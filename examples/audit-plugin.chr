@@ -1,0 +1,40 @@
+module audit_plugin
+cap log.print@1(any...) -> nil "emit audit trail"
+cap clock.now@1() -> i64 "deterministic audit timestamp"
+cap random.u64@1() -> i64 "deterministic request id"
+
+fn risk_points(amount, attempts)
+  let score = 0
+  if amount > 500
+    let score = score + 2
+  end
+  if attempts >= 3
+    let score = score + 3
+  end
+  return score
+end
+
+fn main
+  let timestamp = cap clock.now@1()
+  let request = cap random.u64@1()
+  let amount = 640
+  let attempts = 3
+  let risk = risk_points(amount, attempts)
+  let approved = risk <= 4
+
+  print("audit start", timestamp, request)
+
+  let step = 0
+  while step < 3
+    print("check", step, "risk", risk)
+    let step = step + 1
+  end
+
+  if approved and not (risk > 4)
+    print("decision", "approved", amount)
+    return ["approved", timestamp, request, risk]
+  else
+    print("decision", "review", amount)
+    return ["review", timestamp, request, risk]
+  end
+end

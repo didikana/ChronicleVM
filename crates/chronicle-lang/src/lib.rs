@@ -80,6 +80,10 @@ enum Statement {
 enum Expr {
     Literal(Value),
     Var(String),
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
     Binary {
         op: BinaryOp,
         lhs: Box<Expr>,
@@ -97,13 +101,24 @@ enum Expr {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+enum UnaryOp {
+    Not,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum BinaryOp {
     Add,
     Sub,
     Mul,
     Div,
     Eq,
+    Neq,
     Lt,
+    Gt,
+    Lte,
+    Gte,
+    And,
+    Or,
 }
 
 struct FunctionCompiler {
@@ -326,21 +341,13 @@ impl FunctionCompiler {
                 .get(name)
                 .copied()
                 .ok_or_else(|| err(line, format!("unknown variable {name}"))),
-            Expr::Binary { op, lhs, rhs } => {
-                let lhs = self.compile_expr(lhs, line)?;
-                let rhs = self.compile_expr(rhs, line)?;
-                let dst = self.alloc();
-                let instruction = match op {
-                    BinaryOp::Add => Instruction::Add { dst, lhs, rhs },
-                    BinaryOp::Sub => Instruction::Sub { dst, lhs, rhs },
-                    BinaryOp::Mul => Instruction::Mul { dst, lhs, rhs },
-                    BinaryOp::Div => Instruction::Div { dst, lhs, rhs },
-                    BinaryOp::Eq => Instruction::Eq { dst, lhs, rhs },
-                    BinaryOp::Lt => Instruction::Lt { dst, lhs, rhs },
-                };
-                self.push(line, instruction);
-                Ok(dst)
+            Expr::Unary { op, expr } => {
+                let register = self.compile_expr(expr, line)?;
+                match op {
+                    UnaryOp::Not => self.compile_not(register, line),
+                }
             }
+            Expr::Binary { op, lhs, rhs } => self.compile_binary(op, lhs, rhs, line),
             Expr::Array(items) => {
                 let mut registers = Vec::new();
                 for item in items {
@@ -458,6 +465,108 @@ impl FunctionCompiler {
             self.constants.push(value);
             self.constants.len() - 1
         }
+    }
+
+    fn compile_binary(
+        &mut self,
+        op: &BinaryOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        line: usize,
+    ) -> Result<usize> {
+        let lhs = self.compile_expr(lhs, line)?;
+        let rhs = self.compile_expr(rhs, line)?;
+        let dst = self.alloc();
+        let instruction = match op {
+            BinaryOp::Add => Instruction::Add { dst, lhs, rhs },
+            BinaryOp::Sub => Instruction::Sub { dst, lhs, rhs },
+            BinaryOp::Mul => Instruction::Mul { dst, lhs, rhs },
+            BinaryOp::Div => Instruction::Div { dst, lhs, rhs },
+            BinaryOp::Eq => Instruction::Eq { dst, lhs, rhs },
+            BinaryOp::Lt => Instruction::Lt { dst, lhs, rhs },
+            BinaryOp::Gt => Instruction::Lt {
+                dst,
+                lhs: rhs,
+                rhs: lhs,
+            },
+            BinaryOp::Neq => {
+                self.push(line, Instruction::Eq { dst, lhs, rhs });
+                return self.compile_not(dst, line);
+            }
+            BinaryOp::Lte => {
+                self.push(
+                    line,
+                    Instruction::Lt {
+                        dst,
+                        lhs: rhs,
+                        rhs: lhs,
+                    },
+                );
+                return self.compile_not(dst, line);
+            }
+            BinaryOp::Gte => {
+                self.push(line, Instruction::Lt { dst, lhs, rhs });
+                return self.compile_not(dst, line);
+            }
+            BinaryOp::And => return self.compile_and(lhs, rhs, line),
+            BinaryOp::Or => return self.compile_or(lhs, rhs, line),
+        };
+        self.push(line, instruction);
+        Ok(dst)
+    }
+
+    fn compile_not(&mut self, src: usize, line: usize) -> Result<usize> {
+        let false_reg = self.alloc_bool(false, line);
+        let dst = self.alloc();
+        self.push(
+            line,
+            Instruction::Eq {
+                dst,
+                lhs: src,
+                rhs: false_reg,
+            },
+        );
+        Ok(dst)
+    }
+
+    fn compile_and(&mut self, lhs: usize, rhs: usize, line: usize) -> Result<usize> {
+        let dst = self.alloc_bool(false, line);
+        let jump_to_rhs = self.push_placeholder(
+            line,
+            Instruction::JumpIf {
+                cond: lhs,
+                target: 0,
+            },
+        );
+        let jump_to_end = self.push_placeholder(line, Instruction::Jump { target: 0 });
+        let rhs_start = self.code.len();
+        self.patch_target(jump_to_rhs, rhs_start);
+        self.push(line, Instruction::Move { dst, src: rhs });
+        let end = self.code.len();
+        self.patch_target(jump_to_end, end);
+        Ok(dst)
+    }
+
+    fn compile_or(&mut self, lhs: usize, rhs: usize, line: usize) -> Result<usize> {
+        let dst = self.alloc_bool(true, line);
+        let jump_to_end_if_lhs = self.push_placeholder(
+            line,
+            Instruction::JumpIf {
+                cond: lhs,
+                target: 0,
+            },
+        );
+        self.push(line, Instruction::Move { dst, src: rhs });
+        let end = self.code.len();
+        self.patch_target(jump_to_end_if_lhs, end);
+        Ok(dst)
+    }
+
+    fn alloc_bool(&mut self, value: bool, line: usize) -> usize {
+        let dst = self.alloc();
+        let constant = self.intern_constant(Value::Bool(value));
+        self.push(line, Instruction::Const { dst, constant });
+        dst
     }
 }
 
@@ -606,10 +715,16 @@ fn statement_returns(statement: &Statement) -> bool {
 }
 
 fn parse_expr(line_no: usize, input: &str) -> Result<Expr> {
-    let input = input.trim();
+    let input = strip_outer_parens(input.trim());
     for (needle, op) in [
+        (" or ", BinaryOp::Or),
+        (" and ", BinaryOp::And),
         (" == ", BinaryOp::Eq),
+        (" != ", BinaryOp::Neq),
+        (" <= ", BinaryOp::Lte),
+        (" >= ", BinaryOp::Gte),
         (" < ", BinaryOp::Lt),
+        (" > ", BinaryOp::Gt),
         (" + ", BinaryOp::Add),
         (" - ", BinaryOp::Sub),
         (" * ", BinaryOp::Mul),
@@ -622,6 +737,13 @@ fn parse_expr(line_no: usize, input: &str) -> Result<Expr> {
                 rhs: Box::new(parse_expr(line_no, rhs)?),
             });
         }
+    }
+
+    if let Some(rest) = input.strip_prefix("not ") {
+        return Ok(Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(parse_expr(line_no, rest)?),
+        });
     }
 
     if input.starts_with('[') && input.ends_with(']') {
@@ -639,6 +761,12 @@ fn parse_expr(line_no: usize, input: &str) -> Result<Expr> {
     }
 
     if let Some((name, args)) = parse_call_shape(line_no, input)? {
+        if name == "print" {
+            return Ok(Expr::CapCall {
+                name: "log.print@1".into(),
+                args,
+            });
+        }
         return Ok(Expr::Call { name, args });
     }
 
@@ -657,6 +785,37 @@ fn parse_expr(line_no: usize, input: &str) -> Result<Expr> {
     } else {
         validate_ident(line_no, input)?;
         Ok(Expr::Var(input.to_string()))
+    }
+}
+
+fn strip_outer_parens(mut input: &str) -> &str {
+    loop {
+        let trimmed = input.trim();
+        if !(trimmed.starts_with('(') && trimmed.ends_with(')')) {
+            return trimmed;
+        }
+        let mut in_string = false;
+        let mut depth = 0usize;
+        let mut wraps = true;
+        for (index, ch) in trimmed.char_indices() {
+            match ch {
+                '"' => in_string = !in_string,
+                '(' if !in_string => depth += 1,
+                ')' if !in_string => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && index != trimmed.len() - 1 {
+                        wraps = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if wraps {
+            input = &trimmed[1..trimmed.len() - 1];
+        } else {
+            return trimmed;
+        }
     }
 }
 
@@ -1123,5 +1282,29 @@ mod tests {
           end
         "#;
         assert!(Compiler::compile(source).is_err());
+    }
+
+    #[test]
+    fn compiles_parentheses_boolean_ops_and_print_sugar() {
+        let source = r#"
+          module ergonomic
+          cap log.print@1(any...) -> nil "audit"
+
+          fn main
+            let score = 7
+            if (score >= 5) and not (score != 7)
+              print("accepted", score)
+              return score > 6
+            else
+              print("rejected", score)
+              return score <= 6
+            end
+          end
+        "#;
+        let compiled = Compiler::compile(source).unwrap();
+        assert!(compiled.casm.contains("cap_call"));
+        assert!(compiled.casm.contains("log.print@1"));
+        assert!(compiled.casm.contains("lt r"));
+        assert!(compiled.casm.contains("eq r"));
     }
 }

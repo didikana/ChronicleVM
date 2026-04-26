@@ -1,0 +1,10 @@
+[capabilities."log.print@1"]
+decision = "grant"
+
+[capabilities."clock.now@1"]
+decision = "mock"
+mock = 1900000000
+
+[capabilities."random.u64@1"]
+decision = "mock"
+mock = 424242

@@ -19,6 +19,7 @@
             Open trace
           </label>
           <button id="loadSample" type="button">Load sample</button>
+          <button id="exportSummary" type="button">Export summary</button>
         </div>
       </header>
 
@@ -45,6 +46,10 @@
         <article>
           <span>Checksum</span>
           <strong id="traceChecksum">-</strong>
+        </article>
+        <article>
+          <span>Replay status</span>
+          <strong id="checksumStatus">-</strong>
         </article>
       </section>
 
@@ -92,6 +97,7 @@
           <div class="tabs" role="tablist" aria-label="Detail views">
             <button class="tab active" data-tab="registers" type="button">Registers</button>
             <button class="tab" data-tab="audit" type="button">Capability Audit</button>
+            <button class="tab" data-tab="source" type="button">Source Map</button>
             <button class="tab" data-tab="raw" type="button">Raw Event</button>
           </div>
 
@@ -103,6 +109,11 @@
           <section id="auditTab" class="tab-panel">
             <h3>Capability Calls</h3>
             <div id="capabilityAudit" class="audit-list"></div>
+          </section>
+
+          <section id="sourceTab" class="tab-panel">
+            <h3>Source-Correlated Execution</h3>
+            <div id="sourceMap" class="source-map"></div>
           </section>
 
           <section id="rawTab" class="tab-panel">

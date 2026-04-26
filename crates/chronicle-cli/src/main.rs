@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use chronicle_asm::Assembler;
 use chronicle_core::{
-    CapabilityDecision, ChronicleError, HostPolicy, Module, ReplayError, Trace, Value, Verifier, Vm,
+    CapabilityDecision, ChronicleError, HostPolicy, Module, ReplayError, Trace, Value, Verifier,
+    Vm, VmLimits,
 };
 use chronicle_lang::Compiler;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -47,6 +48,8 @@ enum Command {
         policy: PathBuf,
         #[arg(long, default_value = "main")]
         entry: String,
+        #[command(flatten)]
+        limits: LimitArgs,
     },
     Trace {
         module: PathBuf,
@@ -56,6 +59,8 @@ enum Command {
         out: PathBuf,
         #[arg(long, default_value = "main")]
         entry: String,
+        #[command(flatten)]
+        limits: LimitArgs,
     },
     Replay {
         trace: PathBuf,
@@ -76,6 +81,29 @@ enum Command {
 enum CompileEmit {
     Binary,
     Casm,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+struct LimitArgs {
+    #[arg(long)]
+    max_instructions: Option<usize>,
+    #[arg(long)]
+    max_call_depth: Option<usize>,
+    #[arg(long)]
+    max_registers: Option<usize>,
+    #[arg(long)]
+    max_array_items: Option<usize>,
+}
+
+impl From<LimitArgs> for VmLimits {
+    fn from(args: LimitArgs) -> Self {
+        Self {
+            max_instructions: args.max_instructions,
+            max_call_depth: args.max_call_depth,
+            max_registers: args.max_registers,
+            max_array_items: args.max_array_items,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -130,10 +158,11 @@ fn main() -> Result<()> {
             module,
             policy,
             entry,
+            limits,
         } => {
             let module = load_module(&module)?;
             let policy = load_policy(&policy)?;
-            let mut vm = Vm::new(module, policy)?;
+            let mut vm = Vm::new(module, policy)?.with_limits(limits.into());
             let result = vm.run_entry(&entry)?;
             println!("{}", render_value(&result));
         }
@@ -142,10 +171,11 @@ fn main() -> Result<()> {
             policy,
             out,
             entry,
+            limits,
         } => {
             let module = load_module(&module)?;
             let policy = load_policy(&policy)?;
-            let mut vm = Vm::new(module, policy)?;
+            let mut vm = Vm::new(module, policy)?.with_limits(limits.into());
             let trace = vm.run_with_trace(&entry)?;
             fs::write(&out, serde_json::to_vec_pretty(&trace)?)?;
             if let Some(error) = trace.error {

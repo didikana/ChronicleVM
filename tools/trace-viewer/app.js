@@ -1,76 +1,91 @@
 const sampleTrace = {
-  module: { name: "safe_plugin" },
+  module: {
+    name: "audit_plugin",
+    functions: [
+      {
+        name: "main",
+        source_lines: [16, 17, 18, 19, 20, 21, 23, 26, 27, 28, 26, 31, 32],
+      },
+    ],
+  },
   entry: "main",
-  checksum: "11078793417402751622",
-  result: { Array: [{ I64: 1800000000 }, { I64: 9001 }] },
+  checksum: "14837601390650843185",
+  result: { Array: [{ String: "review" }, { I64: 1900000000 }, { I64: 424242 }, { I64: 5 }] },
   error: null,
+  source: {
+    16: "let timestamp = cap clock.now@1()",
+    17: "let request = cap random.u64@1()",
+    18: "let amount = 640",
+    19: "let attempts = 3",
+    20: "let risk = risk_points(amount, attempts)",
+    21: "let approved = risk <= 4",
+    23: "print(\"audit start\", timestamp, request)",
+    26: "while step < 3",
+    27: "print(\"check\", step, \"risk\", risk)",
+    28: "let step = step + 1",
+    31: "print(\"decision\", \"review\", amount)",
+    32: "return [\"review\", timestamp, request, risk]",
+  },
   events: [
     {
       function: "main",
       pc: 0,
-      source_line: 7,
-      opcode: "const",
-      register_changes: [{ register: 0, value: { String: "plugin started" } }],
-      capability: null,
-      error: null,
-      checksum: "14606988039263795292",
-    },
-    {
-      function: "main",
-      pc: 1,
-      source_line: 8,
       opcode: "cap_call",
-      register_changes: [{ register: 1, value: "Nil" }],
-      capability: {
-        id: "log.print@1",
-        decision: "granted",
-        args: [{ String: "plugin started" }],
-        result: "Nil",
-      },
-      error: null,
-      checksum: "15509739633879176566",
-    },
-    {
-      function: "main",
-      pc: 2,
-      source_line: 9,
-      opcode: "cap_call",
-      register_changes: [{ register: 2, value: { I64: 1800000000 } }],
+      source_line: 16,
+      register_changes: [{ register: 0, value: { I64: 1900000000 } }],
       capability: {
         id: "clock.now@1",
         decision: "mocked",
         args: [],
-        result: { I64: 1800000000 },
+        result: { I64: 1900000000 },
       },
       error: null,
-      checksum: 101,
+      checksum: "10596808881269225500",
     },
     {
       function: "main",
-      pc: 3,
-      source_line: 10,
+      pc: 1,
       opcode: "cap_call",
-      register_changes: [{ register: 3, value: { I64: 9001 } }],
+      source_line: 17,
+      register_changes: [{ register: 1, value: { I64: 424242 } }],
       capability: {
         id: "random.u64@1",
         decision: "mocked",
         args: [],
-        result: { I64: 9001 },
+        result: { I64: 424242 },
       },
       error: null,
-      checksum: 102,
+      checksum: "11290358912882555221",
     },
     {
       function: "main",
-      pc: 4,
-      source_line: 11,
-      opcode: "array_new",
-      register_changes: [
-        { register: 4, value: { Array: [{ I64: 1800000000 }, { I64: 9001 }] } },
-      ],
-      capability: null,
+      pc: 6,
+      opcode: "cap_call",
+      source_line: 23,
+      register_changes: [{ register: 12, value: "Nil" }],
+      capability: {
+        id: "log.print@1",
+        decision: "granted",
+        args: [{ String: "audit start" }, { I64: 1900000000 }, { I64: 424242 }],
+        result: "Nil",
+      },
       error: null,
-      checksum: 103,
+      checksum: "6941072857733409014",
+    },
+    {
+      function: "main",
+      pc: 12,
+      opcode: "cap_call",
+      source_line: 31,
+      register_changes: [{ register: 28, value: "Nil" }],
+      capability: {
+        id: "log.print@1",
+        decision: "granted",
+        args: [{ String: "decision" }, { String: "review" }, { I64: 640 }],
+        result: "Nil",
+      },
+      error: null,
+      checksum: "10173148359687722360",
     },
   ],
 };
@@ -83,11 +98,13 @@ let filterText = "";
 const elements = {
   fileInput: document.querySelector("#fileInput"),
   loadSample: document.querySelector("#loadSample"),
+  exportSummary: document.querySelector("#exportSummary"),
   dropzone: document.querySelector("#dropzone"),
   moduleName: document.querySelector("#moduleName"),
   entryName: document.querySelector("#entryName"),
   eventCount: document.querySelector("#eventCount"),
   traceChecksum: document.querySelector("#traceChecksum"),
+  checksumStatus: document.querySelector("#checksumStatus"),
   timeline: document.querySelector("#timeline"),
   filterInput: document.querySelector("#filterInput"),
   prevEvent: document.querySelector("#prevEvent"),
@@ -101,6 +118,7 @@ const elements = {
   capabilityDetail: document.querySelector("#capabilityDetail"),
   registerChanges: document.querySelector("#registerChanges"),
   capabilityAudit: document.querySelector("#capabilityAudit"),
+  sourceMap: document.querySelector("#sourceMap"),
   rawEvent: document.querySelector("#rawEvent"),
 };
 
@@ -120,6 +138,10 @@ function renderSummary() {
   elements.entryName.textContent = trace.entry ?? "-";
   elements.eventCount.textContent = trace.events.length.toString();
   elements.traceChecksum.textContent = trace.checksum ?? "-";
+  const checksummedEvents = trace.events.filter((event) => event.checksum !== undefined && event.checksum !== null).length;
+  elements.checksumStatus.textContent = trace.error
+    ? "captured error"
+    : `${checksummedEvents}/${trace.events.length} event checksums`;
 }
 
 function renderTimeline() {
@@ -161,6 +183,7 @@ function renderDetail() {
   renderCapability(event.capability);
   renderRegisterChanges(event.register_changes ?? []);
   renderAudit();
+  renderSourceMap();
   elements.rawEvent.textContent = JSON.stringify(event, null, 2);
 }
 
@@ -196,6 +219,7 @@ function renderRegisterChanges(changes) {
 
 function renderAudit() {
   const calls = new Map();
+  const callRows = [];
   for (const event of trace.events) {
     if (!event.capability) continue;
     const current = calls.get(event.capability.id) ?? { total: 0, granted: 0, mocked: 0 };
@@ -207,16 +231,57 @@ function renderAudit() {
       current.mocked += 1;
     }
     calls.set(event.capability.id, current);
+    callRows.push({ event, capability: event.capability, index: trace.events.indexOf(event) });
   }
   if (!calls.size) {
     elements.capabilityAudit.innerHTML = `<div class="empty-state">No capability calls recorded.</div>`;
     return;
   }
-  elements.capabilityAudit.replaceChildren(
-    ...Array.from(calls.entries()).map(([id, value]) => {
+  const summaryRows = Array.from(calls.entries()).map(([id, value]) => {
       const row = document.createElement("div");
       row.className = "audit-row";
       row.innerHTML = `<span>${escapeHtml(id)}</span><strong>${value.total} calls · ${value.granted} granted · ${value.mocked} mocked</strong>`;
+      return row;
+  });
+  const timeline = document.createElement("div");
+  timeline.className = "cap-timeline";
+  timeline.append(
+    ...callRows.map(({ event, capability, index }) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.innerHTML = `<span>#${index} line ${event.source_line ?? "-"}</span><strong>${escapeHtml(capability.id)} · ${escapeHtml(capability.decision)}</strong>`;
+      button.addEventListener("click", () => {
+        selectedIndex = index;
+        activeTab = "registers";
+        render();
+      });
+      return button;
+    }),
+  );
+  elements.capabilityAudit.replaceChildren(...summaryRows, timeline);
+}
+
+function renderSourceMap() {
+  const rows = trace.events.map((event, index) => ({ event, index }));
+  if (!rows.length) {
+    elements.sourceMap.innerHTML = `<div class="empty-state">No source line data recorded.</div>`;
+    return;
+  }
+  elements.sourceMap.replaceChildren(
+    ...rows.map(({ event, index }) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = index === selectedIndex ? "source-row active" : "source-row";
+      const sourceText = sourceForEvent(event);
+      row.innerHTML = `
+        <span>#${index} ${escapeHtml(event.function)} pc=${event.pc} line=${event.source_line ?? "-"}</span>
+        <strong>${escapeHtml(sourceText)}</strong>
+        <em>${escapeHtml(event.opcode)}${event.capability ? ` · ${event.capability.id}` : ""}</em>
+      `;
+      row.addEventListener("click", () => {
+        selectedIndex = index;
+        render();
+      });
       return row;
     }),
   );
@@ -228,7 +293,45 @@ function renderTabs() {
   }
   document.querySelector("#registersTab").classList.toggle("active", activeTab === "registers");
   document.querySelector("#auditTab").classList.toggle("active", activeTab === "audit");
+  document.querySelector("#sourceTab").classList.toggle("active", activeTab === "source");
   document.querySelector("#rawTab").classList.toggle("active", activeTab === "raw");
+}
+
+function sourceForEvent(event) {
+  if (trace.source && event.source_line != null && trace.source[event.source_line]) {
+    return trace.source[event.source_line];
+  }
+  const fn = trace.module?.functions?.find((item) => item.name === event.function);
+  if (fn?.source_lines?.[event.pc] != null) {
+    return `source line ${fn.source_lines[event.pc]}`;
+  }
+  return event.source_line == null ? "source line unavailable" : `source line ${event.source_line}`;
+}
+
+function exportSummary() {
+  const capCounts = {};
+  for (const event of trace.events) {
+    if (!event.capability) continue;
+    capCounts[event.capability.id] ??= { calls: 0, granted: 0, mocked: 0, replayed: 0 };
+    capCounts[event.capability.id].calls += 1;
+    capCounts[event.capability.id][String(event.capability.decision).toLowerCase()] += 1;
+  }
+  const summary = {
+    module: trace.module?.name,
+    entry: trace.entry,
+    events: trace.events.length,
+    checksum: trace.checksum,
+    result: trace.result,
+    error: trace.error,
+    capabilities: capCounts,
+  };
+  const blob = new Blob([JSON.stringify(summary, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${trace.module?.name ?? "chronicle"}-summary.json`;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function matchesFilter(event) {
@@ -306,6 +409,8 @@ elements.loadSample.addEventListener("click", () => {
   selectedIndex = 0;
   render();
 });
+
+elements.exportSummary.addEventListener("click", exportSummary);
 
 elements.prevEvent.addEventListener("click", () => {
   selectedIndex = clamp(selectedIndex - 1, 0, trace.events.length - 1);

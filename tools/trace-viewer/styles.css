@@ -137,7 +137,7 @@ h3 {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 16px;
 }
@@ -298,6 +298,42 @@ dd {
 .kv-row:last-child,
 .audit-row:last-child {
   border-bottom: 0;
+}
+
+.cap-timeline {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.cap-timeline button,
+.source-row {
+  width: 100%;
+  height: auto;
+  text-align: left;
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+}
+
+.cap-timeline span,
+.source-row span,
+.source-row em {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-style: normal;
+}
+
+.source-map {
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.source-row.active {
+  border-color: var(--accent);
+  background: #eaf5f2;
 }
 
 .tabs {

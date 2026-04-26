@@ -16,11 +16,19 @@ pub enum ChronicleError {
     Policy(#[from] PolicyError),
     #[error("runtime error: {0}")]
     Runtime(String),
+    #[error("resource limit exceeded: {0}")]
+    ResourceLimit(String),
     #[error("replay error: {0}")]
-    Replay(#[from] ReplayError),
+    Replay(#[source] Box<ReplayError>),
 }
 
 pub type Result<T> = std::result::Result<T, ChronicleError>;
+
+impl From<ReplayError> for ChronicleError {
+    fn from(error: ReplayError) -> Self {
+        Self::Replay(Box::new(error))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -1350,12 +1358,23 @@ impl std::fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmLimits {
+    pub max_instructions: Option<usize>,
+    pub max_call_depth: Option<usize>,
+    pub max_registers: Option<usize>,
+    pub max_array_items: Option<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Vm {
     module: Module,
     capabilities: BTreeMap<String, CapabilityDecision>,
     replay_capabilities: Vec<CapabilityTrace>,
     replay_capability_index: usize,
+    limits: VmLimits,
+    instruction_count: usize,
+    call_depth: usize,
 }
 
 impl Vm {
@@ -1368,7 +1387,15 @@ impl Vm {
             capabilities,
             replay_capabilities: Vec::new(),
             replay_capability_index: 0,
+            limits: VmLimits::default(),
+            instruction_count: 0,
+            call_depth: 0,
         })
+    }
+
+    pub fn with_limits(mut self, limits: VmLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub fn run_entry(&mut self, entry: &str) -> Result<Value> {
@@ -1421,6 +1448,9 @@ impl Vm {
             capabilities,
             replay_capabilities: capability_results,
             replay_capability_index: 0,
+            limits: VmLimits::default(),
+            instruction_count: 0,
+            call_depth: 0,
         };
         let (result, events) = vm.execute_collect(&trace.entry, false);
         let result = result?;
@@ -1450,6 +1480,8 @@ impl Vm {
         entry: &str,
         live_capabilities: bool,
     ) -> (Result<Value>, Vec<TraceEvent>) {
+        self.instruction_count = 0;
+        self.call_depth = 0;
         let mut events = Vec::new();
         let Some(index) = self.module.exports.get(entry).copied() else {
             return (
@@ -1471,6 +1503,7 @@ impl Vm {
         live_capabilities: bool,
     ) -> Result<Value> {
         let function = self.module.functions[function_index].clone();
+        self.enter_function(&function)?;
         let mut registers = vec![Value::Nil; function.registers];
         for (index, arg) in args.into_iter().enumerate() {
             registers[index] = arg;
@@ -1489,19 +1522,21 @@ impl Vm {
                 checksum: 0,
             };
             let mut next_pc = pc + 1;
-            let step = self.apply_instruction(
-                &function,
-                &mut registers,
-                &instruction,
-                &mut next_pc,
-                &mut event,
-                events,
-                live_capabilities,
-            );
+            let step = self.consume_instruction_limit().and_then(|_| {
+                self.apply_instruction(
+                    &mut registers,
+                    &instruction,
+                    &mut next_pc,
+                    &mut event,
+                    events,
+                    live_capabilities,
+                )
+            });
             match step {
                 Ok(Some(value)) => {
                     seal_event(&mut event);
                     events.push(event);
+                    self.leave_function();
                     return Ok(value);
                 }
                 Ok(None) => {
@@ -1513,10 +1548,12 @@ impl Vm {
                     event.error = Some(err.to_string());
                     seal_event(&mut event);
                     events.push(event);
+                    self.leave_function();
                     return Err(err);
                 }
             }
         }
+        self.leave_function();
         Err(ChronicleError::Runtime(format!(
             "function {} ended without ret",
             function.name
@@ -1525,7 +1562,6 @@ impl Vm {
 
     fn apply_instruction(
         &mut self,
-        function: &Function,
         registers: &mut [Value],
         instruction: &Instruction,
         next_pc: &mut usize,
@@ -1637,6 +1673,14 @@ impl Vm {
                 set_reg(registers, event, *dst, value);
             }
             Instruction::ArrayNew { dst, items } => {
+                if let Some(max) = self.limits.max_array_items {
+                    if items.len() > max {
+                        return Err(ChronicleError::ResourceLimit(format!(
+                            "array_new requested {} items, max is {max}",
+                            items.len()
+                        )));
+                    }
+                }
                 let value =
                     Value::Array(items.iter().map(|item| registers[*item].clone()).collect());
                 set_reg(registers, event, *dst, value);
@@ -1677,8 +1721,43 @@ impl Vm {
                 });
             }
         }
-        let _ = function;
         Ok(None)
+    }
+
+    fn enter_function(&mut self, function: &Function) -> Result<()> {
+        if let Some(max) = self.limits.max_call_depth {
+            if self.call_depth >= max {
+                return Err(ChronicleError::ResourceLimit(format!(
+                    "call depth exceeded max {max}"
+                )));
+            }
+        }
+        if let Some(max) = self.limits.max_registers {
+            if function.registers > max {
+                return Err(ChronicleError::ResourceLimit(format!(
+                    "function {} uses {} registers, max is {max}",
+                    function.name, function.registers
+                )));
+            }
+        }
+        self.call_depth += 1;
+        Ok(())
+    }
+
+    fn leave_function(&mut self) {
+        self.call_depth = self.call_depth.saturating_sub(1);
+    }
+
+    fn consume_instruction_limit(&mut self) -> Result<()> {
+        if let Some(max) = self.limits.max_instructions {
+            if self.instruction_count >= max {
+                return Err(ChronicleError::ResourceLimit(format!(
+                    "instruction budget exceeded max {max}"
+                )));
+            }
+        }
+        self.instruction_count += 1;
+        Ok(())
     }
 
     fn call_capability(&mut self, name: &str, args: Vec<Value>, live: bool) -> Result<Value> {
@@ -1948,6 +2027,47 @@ mod tests {
         let trace = vm.run_with_trace("main").unwrap();
         let report = Vm::replay(trace).unwrap();
         assert_eq!(report.events_checked, 2);
+    }
+
+    #[test]
+    fn instruction_limit_is_recorded_in_trace() {
+        let module = Module {
+            name: "limited".into(),
+            constants: vec![Value::I64(1)],
+            capabilities: vec![],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 2,
+                arity: 0,
+                code: vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::Ret { src: 1 },
+                ],
+                source_lines: vec![Some(1), Some(2), Some(3)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let mut vm = Vm::new(module, HostPolicy::default())
+            .unwrap()
+            .with_limits(VmLimits {
+                max_instructions: Some(1),
+                ..VmLimits::default()
+            });
+        let trace = vm.run_with_trace("main").unwrap();
+        assert_eq!(trace.events.len(), 2);
+        assert!(trace.error.unwrap().contains("instruction budget"));
+        assert!(trace.events[1]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("instruction budget"));
     }
 
     #[test]

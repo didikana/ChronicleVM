@@ -88,3 +88,43 @@ fn denied_policy_fails_negotiation() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("random.u64@1 Denied"));
 }
+
+#[test]
+fn audit_demo_and_resource_limit_work() {
+    let root = repo_root();
+    let trace = std::env::temp_dir().join(format!(
+        "chronicle-audit-test-{}.ctrace",
+        std::process::id()
+    ));
+    let output = chronicle()
+        .arg("trace")
+        .arg(root.join("examples/audit-plugin.chr"))
+        .arg("--policy")
+        .arg(root.join("examples/audit-policy.toml"))
+        .arg("--out")
+        .arg(&trace)
+        .arg("--max-instructions")
+        .arg("10000")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let replay = chronicle().arg("replay").arg(&trace).output().unwrap();
+    assert!(replay.status.success());
+    let replay_stdout = String::from_utf8(replay.stdout).unwrap();
+    assert!(replay_stdout.contains("replayed"));
+
+    let limited = chronicle()
+        .arg("run")
+        .arg(root.join("examples/audit-plugin.chr"))
+        .arg("--policy")
+        .arg(root.join("examples/audit-policy.toml"))
+        .arg("--max-instructions")
+        .arg("1")
+        .output()
+        .unwrap();
+    assert!(!limited.status.success());
+    let stderr = String::from_utf8(limited.stderr).unwrap();
+    assert!(stderr.contains("instruction budget"));
+    let _ = std::fs::remove_file(trace);
+}

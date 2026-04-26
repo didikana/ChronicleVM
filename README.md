@@ -37,6 +37,24 @@ cargo run -p chronicle-cli -- run examples/plugin.casm --policy examples/plugin-
 cargo run -p chronicle-cli -- run examples/plugin.chr --policy examples/plugin-mock.toml
 ```
 
+## 5-Minute Demo
+
+The flagship demo is a deterministic audit plugin. It uses the high-level
+language, typed capability negotiation, mocked time/randomness, tracing, replay,
+CLI debugging, and the browser trace viewer.
+
+```sh
+cargo run -p chronicle-cli -- compile examples/audit-plugin.chr --out /tmp/audit.cmod
+cargo run -p chronicle-cli -- negotiate /tmp/audit.cmod --policy examples/audit-policy.toml
+cargo run -p chronicle-cli -- trace /tmp/audit.cmod --policy examples/audit-policy.toml --out /tmp/audit.ctrace --max-instructions 10000
+cargo run -p chronicle-cli -- inspect /tmp/audit.ctrace
+cargo run -p chronicle-cli -- replay /tmp/audit.ctrace
+cargo run -p chronicle-cli -- debug /tmp/audit.ctrace --commands "source;next;regs;caps;jump 20;event;quit"
+python3 -m http.server 4173 --directory tools/trace-viewer
+```
+
+Then visit `http://localhost:4173` and open `/tmp/audit.ctrace`.
+
 ## Assembly Sketch
 
 ```asm
@@ -94,8 +112,10 @@ end
 
 The language supports multiple functions, parameter passing, user function
 calls, `if`/`else`, `while`, reassignment through `let`, literals, variables,
-arrays, arithmetic/comparison with spaced operators such as `a + b`, and
-capability calls like `cap clock.now@1()`.
+arrays, parenthesized expressions, boolean operators (`and`, `or`, `not`),
+comparisons (`==`, `!=`, `<`, `>`, `<=`, `>=`), arithmetic with spaced operators
+such as `a + b`, capability calls like `cap clock.now@1()`, and `print(...)`
+sugar for `cap log.print@1(...)`.
 
 ```text
 fn bump(value)
@@ -123,6 +143,29 @@ end
 ```sh
 cargo bench -p chronicle-cli
 ```
+
+## Install Locally
+
+```sh
+cargo install --path crates/chronicle-cli
+```
+
+After installation, the CLI is available as `chronicle`.
+
+## Resource Limits
+
+`run` and `trace` accept deterministic sandbox limits:
+
+```sh
+chronicle run examples/audit-plugin.chr --policy examples/audit-policy.toml \
+  --max-instructions 10000 \
+  --max-call-depth 32 \
+  --max-registers 256 \
+  --max-array-items 1024
+```
+
+If a limit is hit during tracing, the trace records the failed event and the
+resource-limit error.
 
 ## Trace Debugger
 

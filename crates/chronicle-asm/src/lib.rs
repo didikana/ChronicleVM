@@ -74,15 +74,13 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            if current.is_some() {
+            if let Some(builder) = current.as_mut() {
                 if let Some(label) = line.strip_suffix(':') {
-                    let builder = current.as_mut().expect("checked above");
                     builder
                         .labels
                         .insert(label.trim().to_string(), builder.pending.len());
                 } else {
                     let instruction = self.parse_instruction(line_no, line)?;
-                    let builder = current.as_mut().expect("checked above");
                     builder.pending.push((line_no, instruction));
                 }
                 continue;
