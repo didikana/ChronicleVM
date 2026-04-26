@@ -34,6 +34,20 @@ struct Parser<'a> {
     source: &'a str,
     module_name: Option<String>,
     capabilities: Vec<CapabilityDecl>,
+    functions: Vec<SourceFunction>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LogicalLine {
+    line: usize,
+    text: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SourceFunction {
+    line: usize,
+    name: String,
+    params: Vec<String>,
     body: Vec<SourceStatement>,
 }
 
@@ -45,9 +59,21 @@ struct SourceStatement {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Statement {
-    Let { name: String, expr: Expr },
+    Let {
+        name: String,
+        expr: Expr,
+    },
     Expr(Expr),
     Return(Expr),
+    If {
+        condition: Expr,
+        then_body: Vec<SourceStatement>,
+        else_body: Vec<SourceStatement>,
+    },
+    While {
+        condition: Expr,
+        body: Vec<SourceStatement>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +87,10 @@ enum Expr {
     },
     Array(Vec<Expr>),
     CapCall {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Call {
         name: String,
         args: Vec<Expr>,
     },
@@ -83,6 +113,9 @@ struct FunctionCompiler {
     code: Vec<Instruction>,
     source_lines: Vec<Option<usize>>,
     declared_caps: BTreeSet<String>,
+    function_names: BTreeSet<String>,
+    function_name: String,
+    arity: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -91,64 +124,87 @@ impl<'a> Parser<'a> {
             source,
             module_name: None,
             capabilities: Vec::new(),
-            body: Vec::new(),
+            functions: Vec::new(),
         }
     }
 
     fn parse(mut self) -> Result<CompiledProgram> {
-        let mut in_function = false;
-        for (index, raw_line) in self.source.lines().enumerate() {
-            let line_no = index + 1;
-            let cleaned = strip_comment(raw_line);
-            let line = cleaned.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            if in_function {
-                if line == "end" {
-                    in_function = false;
-                    continue;
-                }
-                self.body.push(SourceStatement {
-                    line: line_no,
-                    kind: parse_statement(line_no, line)?,
-                });
-                continue;
-            }
-
-            if let Some(rest) = line.strip_prefix("module ") {
-                self.module_name = Some(parse_name_or_string(line_no, rest.trim())?);
-            } else if let Some(rest) = line.strip_prefix("cap ") {
+        let lines = logical_lines(self.source);
+        let mut index = 0;
+        while index < lines.len() {
+            let line = &lines[index];
+            if let Some(rest) = line.text.strip_prefix("module ") {
+                self.module_name = Some(parse_name_or_string(line.line, rest.trim())?);
+                index += 1;
+            } else if let Some(rest) = line.text.strip_prefix("cap ") {
                 self.capabilities
-                    .push(parse_capability(line_no, rest.trim())?);
-            } else if line == "fn main" {
-                in_function = true;
+                    .push(parse_capability(line.line, rest.trim())?);
+                index += 1;
+            } else if let Some(rest) = line.text.strip_prefix("fn ") {
+                let (name, params) = parse_function_header(line.line, rest.trim())?;
+                let body_lines = collect_function_body(&lines, &mut index)?;
+                let mut body_index = 0;
+                let body = parse_block(&body_lines, &mut body_index, false)?;
+                if body_index != body_lines.len() {
+                    return Err(err(
+                        body_lines[body_index].line,
+                        "unexpected block terminator",
+                    ));
+                }
+                self.functions.push(SourceFunction {
+                    line: line.line,
+                    name,
+                    params,
+                    body,
+                });
             } else {
-                return Err(err(line_no, "expected module, cap, or fn main"));
+                return Err(err(line.line, "expected module, cap, or fn"));
             }
-        }
-
-        if in_function {
-            return Err(err(self.source.lines().count(), "function missing end"));
         }
 
         let module_name = self.module_name.ok_or(LangError::MissingModule)?;
-        if self.body.is_empty() {
+        if self.functions.is_empty() {
             return Err(LangError::MissingFunction);
         }
 
-        let mut compiler = FunctionCompiler::new(&self.capabilities);
-        for statement in &self.body {
-            compiler.compile_statement(statement)?;
+        let mut seen_functions = BTreeSet::new();
+        for function in &self.functions {
+            if !seen_functions.insert(function.name.clone()) {
+                return Err(err(
+                    function.line,
+                    format!("duplicate function {}", function.name),
+                ));
+            }
         }
-        let (constants, function) = compiler.finish();
+        if !seen_functions.contains("main") {
+            return Err(err(0, "program must define main"));
+        }
+
+        let mut constants = Vec::new();
+        let mut functions = Vec::new();
+        for function in &self.functions {
+            let mut compiler = FunctionCompiler::new(
+                &self.capabilities,
+                seen_functions.clone(),
+                function.name.clone(),
+                &function.params,
+            )?;
+            for statement in &function.body {
+                compiler.compile_statement(statement)?;
+            }
+            functions.push(compiler.finish(&mut constants));
+        }
+        let exports = functions
+            .iter()
+            .enumerate()
+            .map(|(index, function)| (function.name.clone(), index))
+            .collect();
         let module = Module {
             name: module_name,
             constants,
             capabilities: self.capabilities,
-            functions: vec![function],
-            exports: BTreeMap::from([("main".into(), 0)]),
+            functions,
+            exports,
         };
         Verifier::verify(&module)?;
         let casm = render_casm(&module);
@@ -157,22 +213,47 @@ impl<'a> Parser<'a> {
 }
 
 impl FunctionCompiler {
-    fn new(capabilities: &[CapabilityDecl]) -> Self {
-        Self {
+    fn new(
+        capabilities: &[CapabilityDecl],
+        function_names: BTreeSet<String>,
+        function_name: String,
+        params: &[String],
+    ) -> Result<Self> {
+        let mut variables = BTreeMap::new();
+        for (index, param) in params.iter().enumerate() {
+            validate_ident(0, param)?;
+            if variables.insert(param.clone(), index).is_some() {
+                return Err(err(0, format!("duplicate parameter {param}")));
+            }
+        }
+        Ok(Self {
             constants: Vec::new(),
-            variables: BTreeMap::new(),
-            next_register: 0,
+            variables,
+            next_register: params.len(),
             code: Vec::new(),
             source_lines: Vec::new(),
             declared_caps: capabilities.iter().map(|cap| cap.id.clone()).collect(),
-        }
+            function_names,
+            function_name,
+            arity: params.len(),
+        })
     }
 
     fn compile_statement(&mut self, statement: &SourceStatement) -> Result<()> {
         match &statement.kind {
             Statement::Let { name, expr } => {
-                let register = self.compile_expr(expr, statement.line)?;
-                self.variables.insert(name.clone(), register);
+                let value_register = self.compile_expr(expr, statement.line)?;
+                if let Some(existing) = self.variables.get(name).copied() {
+                    self.push(
+                        statement.line,
+                        Instruction::Move {
+                            dst: existing,
+                            src: value_register,
+                        },
+                    );
+                } else {
+                    self.variables.insert(name.clone(), value_register);
+                }
             }
             Statement::Expr(expr) => {
                 self.compile_expr(expr, statement.line)?;
@@ -180,6 +261,53 @@ impl FunctionCompiler {
             Statement::Return(expr) => {
                 let register = self.compile_expr(expr, statement.line)?;
                 self.push(statement.line, Instruction::Ret { src: register });
+            }
+            Statement::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                let variables_before_block = self.variables.clone();
+                let cond = self.compile_expr(condition, statement.line)?;
+                let jump_to_then =
+                    self.push_placeholder(statement.line, Instruction::JumpIf { cond, target: 0 });
+                for nested in else_body {
+                    self.compile_statement(nested)?;
+                }
+                self.variables = variables_before_block.clone();
+                let jump_to_end = if block_returns(else_body) {
+                    None
+                } else {
+                    Some(self.push_placeholder(statement.line, Instruction::Jump { target: 0 }))
+                };
+                let then_start = self.code.len();
+                self.patch_target(jump_to_then, then_start);
+                for nested in then_body {
+                    self.compile_statement(nested)?;
+                }
+                self.variables = variables_before_block;
+                let end = self.code.len();
+                if let Some(jump_to_end) = jump_to_end {
+                    self.patch_target(jump_to_end, end);
+                }
+            }
+            Statement::While { condition, body } => {
+                let variables_before_block = self.variables.clone();
+                let loop_start = self.code.len();
+                let cond = self.compile_expr(condition, statement.line)?;
+                let jump_to_body =
+                    self.push_placeholder(statement.line, Instruction::JumpIf { cond, target: 0 });
+                let jump_to_end =
+                    self.push_placeholder(statement.line, Instruction::Jump { target: 0 });
+                let body_start = self.code.len();
+                self.patch_target(jump_to_body, body_start);
+                for nested in body {
+                    self.compile_statement(nested)?;
+                }
+                self.variables = variables_before_block;
+                self.push(statement.line, Instruction::Jump { target: loop_start });
+                let end = self.code.len();
+                self.patch_target(jump_to_end, end);
             }
         }
         Ok(())
@@ -247,32 +375,70 @@ impl FunctionCompiler {
                 );
                 Ok(dst)
             }
+            Expr::Call { name, args } => {
+                if !self.function_names.contains(name) {
+                    return Err(err(line, format!("unknown function {name}")));
+                }
+                let mut registers = Vec::new();
+                for arg in args {
+                    registers.push(self.compile_expr(arg, line)?);
+                }
+                let dst = self.alloc();
+                self.push(
+                    line,
+                    Instruction::Call {
+                        dst,
+                        function: name.clone(),
+                        args: registers,
+                    },
+                );
+                Ok(dst)
+            }
         }
     }
 
-    fn finish(mut self) -> (Vec<Value>, Function) {
+    fn finish(mut self, module_constants: &mut Vec<Value>) -> Function {
         if !matches!(self.code.last(), Some(Instruction::Ret { .. })) {
             let dst = self.alloc();
             let constant = self.intern_constant(Value::Nil);
             self.push(0, Instruction::Const { dst, constant });
             self.push(0, Instruction::Ret { src: dst });
         }
-        (
-            self.constants,
-            Function {
-                name: "main".into(),
-                registers: self.next_register.max(1),
-                arity: 0,
-                code: self.code,
-                source_lines: self.source_lines,
-            },
-        )
+        for instruction in &mut self.code {
+            if let Instruction::Const { constant, .. } = instruction {
+                let value = self.constants[*constant].clone();
+                *constant = intern_module_constant(module_constants, value);
+            }
+        }
+        Function {
+            name: self.function_name,
+            registers: self.next_register.max(1),
+            arity: self.arity,
+            code: self.code,
+            source_lines: self.source_lines,
+        }
     }
 
     fn push(&mut self, line: usize, instruction: Instruction) {
         self.code.push(instruction);
         self.source_lines
             .push(if line == 0 { None } else { Some(line) });
+    }
+
+    fn push_placeholder(&mut self, line: usize, instruction: Instruction) -> usize {
+        let index = self.code.len();
+        self.push(line, instruction);
+        index
+    }
+
+    fn patch_target(&mut self, index: usize, target: usize) {
+        match &mut self.code[index] {
+            Instruction::Jump { target: existing }
+            | Instruction::JumpIf {
+                target: existing, ..
+            } => *existing = target,
+            _ => unreachable!("only jump instructions can be patched"),
+        }
     }
 
     fn alloc(&mut self) -> usize {
@@ -313,6 +479,132 @@ fn parse_statement(line_no: usize, line: &str) -> Result<Statement> {
     }
 }
 
+fn logical_lines(source: &str) -> Vec<LogicalLine> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, raw_line)| {
+            let text = strip_comment(raw_line).trim().to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(LogicalLine {
+                    line: index + 1,
+                    text,
+                })
+            }
+        })
+        .collect()
+}
+
+fn collect_function_body(lines: &[LogicalLine], index: &mut usize) -> Result<Vec<LogicalLine>> {
+    let fn_line = lines[*index].line;
+    *index += 1;
+    let mut depth = 0usize;
+    let mut body = Vec::new();
+    while *index < lines.len() {
+        let line = &lines[*index];
+        if starts_block(&line.text) {
+            depth += 1;
+            body.push(line.clone());
+            *index += 1;
+        } else if line.text == "end" {
+            if depth == 0 {
+                *index += 1;
+                return Ok(body);
+            }
+            depth -= 1;
+            body.push(line.clone());
+            *index += 1;
+        } else {
+            body.push(line.clone());
+            *index += 1;
+        }
+    }
+    Err(err(fn_line, "function missing end"))
+}
+
+fn parse_block(
+    lines: &[LogicalLine],
+    index: &mut usize,
+    stop_on_else: bool,
+) -> Result<Vec<SourceStatement>> {
+    let mut statements = Vec::new();
+    while *index < lines.len() {
+        let line = &lines[*index];
+        if line.text == "end" || (stop_on_else && line.text == "else") {
+            break;
+        }
+        if line.text == "else" {
+            return Err(err(line.line, "else without matching if"));
+        }
+        if let Some(rest) = line.text.strip_prefix("if ") {
+            let condition = parse_expr(line.line, rest.trim())?;
+            *index += 1;
+            let then_body = parse_block(lines, index, true)?;
+            let else_body = if *index < lines.len() && lines[*index].text == "else" {
+                *index += 1;
+                parse_block(lines, index, false)?
+            } else {
+                Vec::new()
+            };
+            if *index >= lines.len() || lines[*index].text != "end" {
+                return Err(err(line.line, "if missing end"));
+            }
+            *index += 1;
+            statements.push(SourceStatement {
+                line: line.line,
+                kind: Statement::If {
+                    condition,
+                    then_body,
+                    else_body,
+                },
+            });
+        } else if let Some(rest) = line.text.strip_prefix("while ") {
+            let condition = parse_expr(line.line, rest.trim())?;
+            *index += 1;
+            let body = parse_block(lines, index, false)?;
+            if *index >= lines.len() || lines[*index].text != "end" {
+                return Err(err(line.line, "while missing end"));
+            }
+            *index += 1;
+            statements.push(SourceStatement {
+                line: line.line,
+                kind: Statement::While { condition, body },
+            });
+        } else {
+            statements.push(SourceStatement {
+                line: line.line,
+                kind: parse_statement(line.line, &line.text)?,
+            });
+            *index += 1;
+        }
+    }
+    Ok(statements)
+}
+
+fn starts_block(line: &str) -> bool {
+    line.starts_with("if ") || line.starts_with("while ")
+}
+
+fn block_returns(statements: &[SourceStatement]) -> bool {
+    statements
+        .last()
+        .is_some_and(|statement| statement_returns(&statement.kind))
+}
+
+fn statement_returns(statement: &Statement) -> bool {
+    match statement {
+        Statement::Return(_) => true,
+        Statement::If {
+            then_body,
+            else_body,
+            ..
+        } => !else_body.is_empty() && block_returns(then_body) && block_returns(else_body),
+        _ => false,
+    }
+}
+
 fn parse_expr(line_no: usize, input: &str) -> Result<Expr> {
     let input = input.trim();
     for (needle, op) in [
@@ -346,6 +638,10 @@ fn parse_expr(line_no: usize, input: &str) -> Result<Expr> {
         return parse_cap_call(line_no, rest.trim());
     }
 
+    if let Some((name, args)) = parse_call_shape(line_no, input)? {
+        return Ok(Expr::Call { name, args });
+    }
+
     if input == "nil" {
         Ok(Expr::Literal(Value::Nil))
     } else if input == "true" {
@@ -361,6 +657,54 @@ fn parse_expr(line_no: usize, input: &str) -> Result<Expr> {
     } else {
         validate_ident(line_no, input)?;
         Ok(Expr::Var(input.to_string()))
+    }
+}
+
+fn parse_function_header(line_no: usize, input: &str) -> Result<(String, Vec<String>)> {
+    if let Some(open) = input.find('(') {
+        if !input.ends_with(')') {
+            return Err(err(line_no, "function header missing ')'"));
+        }
+        let name = input[..open].trim();
+        validate_ident(line_no, name)?;
+        let params = split_args(line_no, &input[open + 1..input.len() - 1])?;
+        for param in &params {
+            validate_ident(line_no, param)?;
+        }
+        Ok((name.to_string(), params))
+    } else {
+        validate_ident(line_no, input)?;
+        Ok((input.to_string(), Vec::new()))
+    }
+}
+
+fn parse_call_shape(line_no: usize, input: &str) -> Result<Option<(String, Vec<Expr>)>> {
+    let Some(open) = input.find('(') else {
+        return Ok(None);
+    };
+    if !input.ends_with(')') {
+        return Ok(None);
+    }
+    let name = input[..open].trim();
+    if !is_valid_ident(name) {
+        return Ok(None);
+    }
+    let inner = &input[open + 1..input.len() - 1];
+    Ok(Some((
+        name.to_string(),
+        split_args(line_no, inner)?
+            .into_iter()
+            .map(|arg| parse_expr(line_no, &arg))
+            .collect::<Result<Vec<_>>>()?,
+    )))
+}
+
+fn intern_module_constant(constants: &mut Vec<Value>, value: Value) -> usize {
+    if let Some(index) = constants.iter().position(|existing| existing == &value) {
+        index
+    } else {
+        constants.push(value);
+        constants.len() - 1
     }
 }
 
@@ -460,14 +804,19 @@ fn render_casm(module: &Module) -> String {
     }
     out.push('\n');
 
-    let function = &module.functions[0];
-    out.push_str(&format!(".fn main r{}\n", function.registers));
-    for instruction in &function.code {
-        out.push_str("  ");
-        out.push_str(&render_instruction(instruction, &module.constants));
+    for function in &module.functions {
+        out.push_str(&format!(".fn {} r{}", function.name, function.registers));
+        if function.arity > 0 {
+            out.push_str(&format!(" arity={}", function.arity));
+        }
         out.push('\n');
+        for instruction in &function.code {
+            out.push_str("  ");
+            out.push_str(&render_instruction(instruction, &module.constants));
+            out.push('\n');
+        }
+        out.push_str(".end\n\n");
     }
-    out.push_str(".end\n");
     out
 }
 
@@ -634,17 +983,22 @@ fn parse_quoted(line_no: usize, input: &str) -> Result<String> {
 }
 
 fn validate_ident(line_no: usize, input: &str) -> Result<()> {
+    if is_valid_ident(input) {
+        Ok(())
+    } else {
+        Err(err(line_no, format!("invalid identifier {input}")))
+    }
+}
+
+fn is_valid_ident(input: &str) -> bool {
     let mut chars = input.chars();
     let Some(first) = chars.next() else {
-        return Err(err(line_no, "empty identifier"));
+        return false;
     };
     if !(first == '_' || first.is_ascii_alphabetic()) {
-        return Err(err(line_no, format!("invalid identifier {input}")));
+        return false;
     }
-    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
-        return Err(err(line_no, format!("invalid identifier {input}")));
-    }
-    Ok(())
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn validate_cap_name(line_no: usize, input: &str) -> Result<()> {
@@ -721,6 +1075,51 @@ mod tests {
           module bad
           fn main
             cap log.print@1("hello")
+          end
+        "#;
+        assert!(Compiler::compile(source).is_err());
+    }
+
+    #[test]
+    fn compiles_functions_branches_and_loops() {
+        let source = r#"
+          module language_demo
+
+          fn bump(value)
+            return value + 1
+          end
+
+          fn main
+            let i = 0
+            let total = 0
+            while i < 4
+              let total = total + bump(i)
+              let i = i + 1
+            end
+            if total == 10
+              return "ok"
+            else
+              return "bad"
+            end
+          end
+        "#;
+        let compiled = Compiler::compile(source).unwrap();
+        assert_eq!(compiled.module.functions.len(), 2);
+        assert!(compiled.casm.contains(".fn bump r"));
+        assert!(compiled.casm.contains("arity=1"));
+        assert!(compiled.casm.contains("jump_if"));
+        assert!(compiled.casm.contains("call r"));
+    }
+
+    #[test]
+    fn block_local_variables_do_not_leak() {
+        let source = r#"
+          module scoped
+          fn main
+            if true
+              let hidden = 1
+            end
+            return hidden
           end
         "#;
         assert!(Compiler::compile(source).is_err());

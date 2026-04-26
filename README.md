@@ -92,9 +92,31 @@ fn main
 end
 ```
 
-Supported v1 expressions are literals, variables, arrays, arithmetic/comparison
-with spaced operators such as `a + b`, and capability calls like
-`cap clock.now@1()`.
+The language supports multiple functions, parameter passing, user function
+calls, `if`/`else`, `while`, reassignment through `let`, literals, variables,
+arrays, arithmetic/comparison with spaced operators such as `a + b`, and
+capability calls like `cap clock.now@1()`.
+
+```text
+fn bump(value)
+  return value + 1
+end
+
+fn main
+  let i = 0
+  let total = 0
+  while i < 4
+    let total = total + bump(i)
+    let i = i + 1
+  end
+
+  if total == 10
+    return "ok"
+  else
+    return "bad"
+  end
+end
+```
 
 ## Benchmarks
 

@@ -1,0 +1,23 @@
+module language_demo
+cap log.print@1(any...) -> nil "emit loop result"
+
+fn bump(value)
+  return value + 1
+end
+
+fn main
+  let i = 0
+  let total = 0
+  while i < 4
+    let total = total + bump(i)
+    let i = i + 1
+  end
+
+  if total == 10
+    cap log.print@1("loop total ok", total)
+    return "ok"
+  else
+    cap log.print@1("loop total mismatch", total)
+    return "bad"
+  end
+end
