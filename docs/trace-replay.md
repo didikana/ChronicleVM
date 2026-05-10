@@ -32,7 +32,26 @@ final checksum over the replay-relevant event stream.
 `chronicle debug trace.ctrace` opens a small trace debugger over the recorded
 event stream. It never re-executes the VM; it reconstructs register state from
 recorded register changes and lets the user step through the trace with
-`next`, `prev`, `jump N`, `regs`, `caps`, `event`, and `source`.
+`next`, `prev`, `back N`, `forward N`, `jump N`, `state`, `regs`, `caps`,
+`diff A B`, `slice A B`, `why`, `event`, and `source`.
+
+## Time-Travel Model
+
+ChronicleVM time travel is trace-derived and deterministic. A
+`TraceNavigator` reconstructs the register state at any event by replaying the
+recorded register changes only; it does not call host capabilities or execute
+bytecode. It can produce:
+
+- point-in-time register state for an event,
+- event-to-event register diffs,
+- capability calls inside an event range,
+- source-correlated windows around an event,
+- trace slices for focused inspection.
+
+Trace slices are smaller `.ctrace` files intended for inspection, debugging,
+and sharing a focused window of execution. Exact deterministic replay remains a
+guarantee for full captured traces, because sliced traces may omit prior state
+and earlier capability events required to re-execute from module entry.
 
 ## Web Viewer
 

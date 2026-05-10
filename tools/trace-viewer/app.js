@@ -99,6 +99,7 @@ const elements = {
   fileInput: document.querySelector("#fileInput"),
   loadSample: document.querySelector("#loadSample"),
   exportSummary: document.querySelector("#exportSummary"),
+  exportSlice: document.querySelector("#exportSlice"),
   dropzone: document.querySelector("#dropzone"),
   moduleName: document.querySelector("#moduleName"),
   entryName: document.querySelector("#entryName"),
@@ -117,6 +118,9 @@ const elements = {
   eventLine: document.querySelector("#eventLine"),
   capabilityDetail: document.querySelector("#capabilityDetail"),
   registerChanges: document.querySelector("#registerChanges"),
+  registerState: document.querySelector("#registerState"),
+  eventDiff: document.querySelector("#eventDiff"),
+  whyEvent: document.querySelector("#whyEvent"),
   capabilityAudit: document.querySelector("#capabilityAudit"),
   sourceMap: document.querySelector("#sourceMap"),
   rawEvent: document.querySelector("#rawEvent"),
@@ -182,6 +186,9 @@ function renderDetail() {
   elements.eventLine.textContent = event.source_line ?? "-";
   renderCapability(event.capability);
   renderRegisterChanges(event.register_changes ?? []);
+  renderRegisterState();
+  renderEventDiff();
+  renderWhy();
   renderAudit();
   renderSourceMap();
   elements.rawEvent.textContent = JSON.stringify(event, null, 2);
@@ -215,6 +222,76 @@ function renderRegisterChanges(changes) {
       return row;
     }),
   );
+}
+
+function stateAt(index) {
+  const registers = new Map();
+  let lastCapability = null;
+  for (let i = 0; i <= index && i < trace.events.length; i += 1) {
+    const event = trace.events[i];
+    for (const change of event.register_changes ?? []) {
+      registers.set(change.register, change.value);
+    }
+    if (event.capability) lastCapability = event.capability;
+  }
+  return { registers, lastCapability };
+}
+
+function renderRegisterState() {
+  const state = stateAt(selectedIndex);
+  if (!state.registers.size) {
+    elements.registerState.innerHTML = `<div class="empty-state">No registers are set yet.</div>`;
+    return;
+  }
+  elements.registerState.replaceChildren(
+    ...Array.from(state.registers.entries()).map(([register, value]) => {
+      const row = document.createElement("div");
+      row.className = "kv-row";
+      row.innerHTML = `<span>r${register}</span><strong>${formatValue(value)}</strong>`;
+      return row;
+    }),
+  );
+}
+
+function renderEventDiff() {
+  if (selectedIndex === 0) {
+    elements.eventDiff.innerHTML = `<div class="empty-state">Initial event has no previous state.</div>`;
+    return;
+  }
+  const before = stateAt(selectedIndex - 1).registers;
+  const after = stateAt(selectedIndex).registers;
+  const registers = new Set([...before.keys(), ...after.keys()]);
+  const changes = Array.from(registers)
+    .filter((register) => JSON.stringify(before.get(register)) !== JSON.stringify(after.get(register)))
+    .map((register) => ({ register, before: before.get(register), after: after.get(register) }));
+  if (!changes.length) {
+    elements.eventDiff.innerHTML = `<div class="empty-state">No register state changed from the previous event.</div>`;
+    return;
+  }
+  elements.eventDiff.replaceChildren(
+    ...changes.map((change) => {
+      const row = document.createElement("div");
+      row.className = "kv-row";
+      row.innerHTML = `<span>r${change.register}</span><strong>${formatValue(change.before)} -> ${formatValue(change.after)}</strong>`;
+      return row;
+    }),
+  );
+}
+
+function renderWhy() {
+  const event = trace.events[selectedIndex];
+  const previous = selectedIndex > 0 ? trace.events[selectedIndex - 1] : null;
+  const capability = event.capability
+    ? `<div class="cap-line"><span>Capability</span><strong>${escapeHtml(event.capability.id)} · ${escapeHtml(event.capability.decision)} -> ${formatValue(event.capability.result)}</strong></div>`
+    : `<div class="cap-line"><span>Capability</span><strong>none</strong></div>`;
+  elements.whyEvent.innerHTML = `
+    <div class="cap-line"><span>Current</span><strong>#${selectedIndex} ${escapeHtml(event.function)} pc=${event.pc} line=${event.source_line ?? "-"} ${escapeHtml(event.opcode)}</strong></div>
+    <div class="cap-line"><span>Previous</span><strong>${previous ? `#${selectedIndex - 1} ${escapeHtml(previous.function)} pc=${previous.pc} ${escapeHtml(previous.opcode)}` : "none"}</strong></div>
+    <div class="cap-line"><span>Source</span><strong>${escapeHtml(sourceForEvent(event))}</strong></div>
+    <div class="cap-line"><span>Changes</span><strong>${(event.register_changes ?? []).map((change) => `r${change.register}=${formatValue(change.value)}`).join(", ") || "none"}</strong></div>
+    ${capability}
+    <div class="cap-line"><span>Checksum</span><strong>${event.checksum ?? "-"}</strong></div>
+  `;
 }
 
 function renderAudit() {
@@ -292,6 +369,9 @@ function renderTabs() {
     button.classList.toggle("active", button.dataset.tab === activeTab);
   }
   document.querySelector("#registersTab").classList.toggle("active", activeTab === "registers");
+  document.querySelector("#stateTab").classList.toggle("active", activeTab === "state");
+  document.querySelector("#diffTab").classList.toggle("active", activeTab === "diff");
+  document.querySelector("#whyTab").classList.toggle("active", activeTab === "why");
   document.querySelector("#auditTab").classList.toggle("active", activeTab === "audit");
   document.querySelector("#sourceTab").classList.toggle("active", activeTab === "source");
   document.querySelector("#rawTab").classList.toggle("active", activeTab === "raw");
@@ -325,11 +405,32 @@ function exportSummary() {
     error: trace.error,
     capabilities: capCounts,
   };
-  const blob = new Blob([JSON.stringify(summary, null, 2)], { type: "application/json" });
+  downloadJson(summary, `${trace.module?.name ?? "chronicle"}-summary.json`);
+}
+
+function exportSlice() {
+  const from = Number(prompt("Slice from event index", "0"));
+  if (!Number.isInteger(from)) return;
+  const to = Number(prompt("Slice to event index", String(selectedIndex)));
+  if (!Number.isInteger(to)) return;
+  const start = clamp(Math.min(from, to), 0, trace.events.length - 1);
+  const end = clamp(Math.max(from, to), 0, trace.events.length - 1);
+  downloadJson(
+    {
+      ...trace,
+      events: trace.events.slice(start, end + 1),
+      checksum: `slice-${start}-${end}-${trace.checksum ?? "unknown"}`,
+    },
+    `${trace.module?.name ?? "chronicle"}-slice-${start}-${end}.ctrace`,
+  );
+}
+
+function downloadJson(value, filename) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `${trace.module?.name ?? "chronicle"}-summary.json`;
+  link.download = filename;
   link.click();
   URL.revokeObjectURL(url);
 }
@@ -411,6 +512,7 @@ elements.loadSample.addEventListener("click", () => {
 });
 
 elements.exportSummary.addEventListener("click", exportSummary);
+elements.exportSlice.addEventListener("click", exportSlice);
 
 elements.prevEvent.addEventListener("click", () => {
   selectedIndex = clamp(selectedIndex - 1, 0, trace.events.length - 1);

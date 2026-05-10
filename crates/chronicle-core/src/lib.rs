@@ -1280,6 +1280,27 @@ pub struct Trace {
     pub checksum: u64,
 }
 
+impl Trace {
+    pub fn slice(&self, from: usize, to: usize) -> Result<Self> {
+        if from > to || to >= self.events.len() {
+            return Err(ChronicleError::Runtime(format!(
+                "trace slice {from}..={to} out of bounds for {} events",
+                self.events.len()
+            )));
+        }
+        let events = self.events[from..=to].to_vec();
+        let checksum = trace_checksum(&events, &self.result, &self.error);
+        Ok(Self {
+            module: self.module.clone(),
+            entry: self.entry.clone(),
+            events,
+            result: self.result.clone(),
+            error: self.error.clone(),
+            checksum,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TraceEvent {
     pub function: String,
@@ -1326,6 +1347,8 @@ pub struct ReplayDiff {
     pub index: usize,
     pub expected: Option<TraceEvent>,
     pub actual: Option<TraceEvent>,
+    pub expected_state_before: Option<TraceState>,
+    pub actual_state_before: Option<TraceState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1357,6 +1380,162 @@ impl std::fmt::Display for ReplayError {
 }
 
 impl std::error::Error for ReplayError {}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TraceState {
+    pub event_index: usize,
+    pub function: String,
+    pub pc: usize,
+    pub source_line: Option<usize>,
+    pub registers: BTreeMap<usize, Value>,
+    pub last_capability: Option<CapabilityTrace>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StateDiff {
+    pub from: usize,
+    pub to: usize,
+    pub changed_registers: Vec<RegisterChange>,
+    pub from_function: String,
+    pub to_function: String,
+    pub entered_function: Option<String>,
+    pub exited_function: Option<String>,
+    pub capability_calls: Vec<CapabilityTrace>,
+    pub checksum_range: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceLine {
+    pub event_index: usize,
+    pub function: String,
+    pub pc: usize,
+    pub source_line: Option<usize>,
+    pub opcode: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraceNavigator {
+    trace: Trace,
+    states: Vec<TraceState>,
+}
+
+impl TraceNavigator {
+    pub fn new(trace: Trace) -> Self {
+        let mut registers = BTreeMap::new();
+        let mut last_capability = None;
+        let states = trace
+            .events
+            .iter()
+            .enumerate()
+            .map(|(event_index, event)| {
+                for change in &event.register_changes {
+                    registers.insert(change.register, change.value.clone());
+                }
+                if let Some(capability) = &event.capability {
+                    last_capability = Some(capability.clone());
+                }
+                TraceState {
+                    event_index,
+                    function: event.function.clone(),
+                    pc: event.pc,
+                    source_line: event.source_line,
+                    registers: registers.clone(),
+                    last_capability: last_capability.clone(),
+                    error: event.error.clone(),
+                }
+            })
+            .collect();
+        Self { trace, states }
+    }
+
+    pub fn trace(&self) -> &Trace {
+        &self.trace
+    }
+
+    pub fn state_at(&self, event_index: usize) -> Result<TraceState> {
+        self.states.get(event_index).cloned().ok_or_else(|| {
+            ChronicleError::Runtime(format!("event index {event_index} out of bounds"))
+        })
+    }
+
+    pub fn diff_between(&self, from: usize, to: usize) -> Result<StateDiff> {
+        let from_state = self.state_at(from)?;
+        let to_state = self.state_at(to)?;
+        let mut registers = BTreeSet::new();
+        registers.extend(from_state.registers.keys().copied());
+        registers.extend(to_state.registers.keys().copied());
+        let changed_registers = registers
+            .into_iter()
+            .filter_map(|register| {
+                let before = from_state.registers.get(&register);
+                let after = to_state.registers.get(&register);
+                (before != after).then(|| RegisterChange {
+                    register,
+                    value: after.cloned().unwrap_or(Value::Nil),
+                })
+            })
+            .collect();
+        let (start, end) = ordered_range(from, to);
+        let capability_calls = self.capability_calls_between(start, end)?;
+        let checksum_range = self.trace.events[start..=end]
+            .iter()
+            .map(|event| event.checksum)
+            .collect();
+        Ok(StateDiff {
+            from,
+            to,
+            changed_registers,
+            from_function: from_state.function.clone(),
+            to_function: to_state.function.clone(),
+            entered_function: (from_state.function != to_state.function)
+                .then(|| to_state.function.clone()),
+            exited_function: (from_state.function != to_state.function)
+                .then(|| from_state.function.clone()),
+            capability_calls,
+            checksum_range,
+        })
+    }
+
+    pub fn capability_calls_between(&self, from: usize, to: usize) -> Result<Vec<CapabilityTrace>> {
+        let (start, end) = self.checked_range(from, to)?;
+        Ok(self.trace.events[start..=end]
+            .iter()
+            .filter_map(|event| event.capability.clone())
+            .collect())
+    }
+
+    pub fn source_window(&self, event_index: usize, radius: usize) -> Result<Vec<SourceLine>> {
+        self.state_at(event_index)?;
+        let start = event_index.saturating_sub(radius);
+        let end = (event_index + radius).min(self.trace.events.len().saturating_sub(1));
+        Ok(self.trace.events[start..=end]
+            .iter()
+            .enumerate()
+            .map(|(offset, event)| SourceLine {
+                event_index: start + offset,
+                function: event.function.clone(),
+                pc: event.pc,
+                source_line: event.source_line,
+                opcode: event.opcode.clone(),
+            })
+            .collect())
+    }
+
+    fn checked_range(&self, from: usize, to: usize) -> Result<(usize, usize)> {
+        if self.trace.events.is_empty() {
+            return Err(ChronicleError::Runtime("trace has no events".into()));
+        }
+        let (start, end) = ordered_range(from, to);
+        if end >= self.trace.events.len() {
+            return Err(ChronicleError::Runtime(format!(
+                "event range {from}..={to} out of bounds for {} events",
+                self.trace.events.len()
+            )));
+        }
+        Ok((start, end))
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmLimits {
@@ -1844,6 +2023,8 @@ fn first_replay_diff(expected: &[TraceEvent], actual: &[TraceEvent]) -> ReplayDi
                 index,
                 expected: expected_event,
                 actual: actual_event,
+                expected_state_before: state_before(expected, index),
+                actual_state_before: state_before(actual, index),
             };
         }
     }
@@ -1851,6 +2032,39 @@ fn first_replay_diff(expected: &[TraceEvent], actual: &[TraceEvent]) -> ReplayDi
         index: len,
         expected: None,
         actual: None,
+        expected_state_before: state_before(expected, len),
+        actual_state_before: state_before(actual, len),
+    }
+}
+
+fn state_before(events: &[TraceEvent], index: usize) -> Option<TraceState> {
+    if events.is_empty() || index == 0 {
+        return None;
+    }
+    let slice = Trace {
+        module: Module {
+            name: "replay-diff".into(),
+            constants: Vec::new(),
+            capabilities: Vec::new(),
+            functions: Vec::new(),
+            exports: BTreeMap::new(),
+        },
+        entry: "main".into(),
+        events: events[..index.min(events.len())].to_vec(),
+        result: None,
+        error: None,
+        checksum: 0,
+    };
+    TraceNavigator::new(slice)
+        .state_at(index.min(events.len()) - 1)
+        .ok()
+}
+
+fn ordered_range(from: usize, to: usize) -> (usize, usize) {
+    if from <= to {
+        (from, to)
+    } else {
+        (to, from)
     }
 }
 
@@ -2149,6 +2363,83 @@ mod tests {
             ChronicleError::Replay(err) => assert_eq!(err.diff.unwrap().index, 0),
             other => panic!("unexpected error {other:?}"),
         }
+    }
+
+    #[test]
+    fn trace_navigator_reconstructs_state_and_diffs() {
+        let trace = Trace {
+            module: Module {
+                name: "nav".into(),
+                constants: vec![],
+                capabilities: vec![],
+                functions: vec![],
+                exports: BTreeMap::new(),
+            },
+            entry: "main".into(),
+            events: vec![
+                TraceEvent {
+                    function: "main".into(),
+                    pc: 0,
+                    source_line: Some(1),
+                    opcode: "const".into(),
+                    register_changes: vec![RegisterChange {
+                        register: 0,
+                        value: Value::I64(1),
+                    }],
+                    capability: None,
+                    error: None,
+                    checksum: 10,
+                },
+                TraceEvent {
+                    function: "main".into(),
+                    pc: 1,
+                    source_line: Some(2),
+                    opcode: "cap_call".into(),
+                    register_changes: vec![RegisterChange {
+                        register: 1,
+                        value: Value::Nil,
+                    }],
+                    capability: Some(CapabilityTrace {
+                        id: "log.print@1".into(),
+                        decision: CapabilityTraceDecision::Granted,
+                        args: vec![Value::I64(1)],
+                        result: Value::Nil,
+                    }),
+                    error: None,
+                    checksum: 11,
+                },
+                TraceEvent {
+                    function: "helper".into(),
+                    pc: 0,
+                    source_line: Some(3),
+                    opcode: "ret".into(),
+                    register_changes: vec![RegisterChange {
+                        register: 0,
+                        value: Value::I64(2),
+                    }],
+                    capability: None,
+                    error: None,
+                    checksum: 12,
+                },
+            ],
+            result: Some(Value::I64(2)),
+            error: None,
+            checksum: 99,
+        };
+        let navigator = TraceNavigator::new(trace);
+        assert_eq!(
+            navigator.state_at(0).unwrap().registers.get(&0),
+            Some(&Value::I64(1))
+        );
+        let state = navigator.state_at(2).unwrap();
+        assert_eq!(state.registers.get(&0), Some(&Value::I64(2)));
+        assert_eq!(state.last_capability.unwrap().id, "log.print@1");
+        let diff = navigator.diff_between(0, 2).unwrap();
+        assert_eq!(diff.entered_function, Some("helper".into()));
+        assert_eq!(diff.changed_registers.len(), 2);
+        assert_eq!(navigator.capability_calls_between(0, 2).unwrap().len(), 1);
+        assert_eq!(navigator.source_window(1, 1).unwrap().len(), 3);
+        assert!(navigator.state_at(99).is_err());
     }
 
     #[test]

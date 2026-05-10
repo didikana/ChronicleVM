@@ -336,6 +336,17 @@ dd {
   background: #eaf5f2;
 }
 
+.why-panel {
+  display: grid;
+  gap: 2px;
+}
+
+.kv-row strong,
+.cap-line strong {
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
 .tabs {
   display: flex;
   gap: 6px;

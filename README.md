@@ -50,6 +50,9 @@ cargo run -p chronicle-cli -- trace /tmp/audit.cmod --policy examples/audit-poli
 cargo run -p chronicle-cli -- inspect /tmp/audit.ctrace
 cargo run -p chronicle-cli -- replay /tmp/audit.ctrace
 cargo run -p chronicle-cli -- debug /tmp/audit.ctrace --commands "source;next;regs;caps;jump 20;event;quit"
+cargo run -p chronicle-cli -- debug /tmp/audit.ctrace --commands "jump 20;state;back 5;diff 15 20;why;quit"
+cargo run -p chronicle-cli -- trace-slice /tmp/audit.ctrace --from 15 --to 35 --out /tmp/audit-risk-window.ctrace
+cargo run -p chronicle-cli -- inspect /tmp/audit-risk-window.ctrace
 python3 -m http.server 4173 --directory tools/trace-viewer
 ```
 
@@ -173,8 +176,9 @@ resource-limit error.
 chronicle debug /tmp/plugin.ctrace
 ```
 
-The interactive debugger supports `next`, `prev`, `jump N`, `regs`, `caps`,
-`event`, `source`, `help`, and `quit`. For scripted use and tests:
+The interactive debugger supports `next`, `prev`, `back N`, `forward N`,
+`jump N`, `state`, `regs`, `caps`, `diff A B`, `slice A B`, `why`, `event`,
+`source`, `help`, and `quit`. For scripted use and tests:
 
 ```sh
 chronicle debug /tmp/plugin.ctrace --commands "source;next;regs;caps;quit"

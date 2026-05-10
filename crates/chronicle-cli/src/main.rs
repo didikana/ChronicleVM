@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use chronicle_asm::Assembler;
 use chronicle_core::{
-    CapabilityDecision, ChronicleError, HostPolicy, Module, ReplayError, Trace, Value, Verifier,
-    Vm, VmLimits,
+    CapabilityDecision, ChronicleError, HostPolicy, Module, ReplayError, StateDiff, Trace,
+    TraceNavigator, TraceState, Value, Verifier, Vm, VmLimits,
 };
 use chronicle_lang::Compiler;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -69,6 +69,15 @@ enum Command {
     },
     Inspect {
         trace: PathBuf,
+    },
+    TraceSlice {
+        trace: PathBuf,
+        #[arg(long)]
+        from: usize,
+        #[arg(long)]
+        to: usize,
+        #[arg(long)]
+        out: PathBuf,
     },
     Debug {
         trace: PathBuf,
@@ -245,6 +254,24 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::TraceSlice {
+            trace,
+            from,
+            to,
+            out,
+        } => {
+            let trace = load_trace(&trace)?;
+            let sliced = trace.slice(from, to)?;
+            fs::write(&out, serde_json::to_vec_pretty(&sliced)?)?;
+            println!(
+                "wrote {} events {}..={} to {} checksum {}",
+                sliced.events.len(),
+                from,
+                to,
+                out.display(),
+                sliced.checksum
+            );
+        }
         Command::Debug { trace, commands } => {
             let trace = load_trace(&trace)?;
             run_debugger(&trace, commands.as_deref())?;
@@ -374,6 +401,50 @@ fn print_replay_error(error: &ReplayError, verbose: bool) {
                 eprintln!("actual detail: {actual:#?}");
             }
         }
+        if let Some(expected_state) = &diff.expected_state_before {
+            eprintln!(
+                "expected state before: #{} {} pc={} line={:?} registers={}",
+                expected_state.event_index,
+                expected_state.function,
+                expected_state.pc,
+                expected_state.source_line,
+                expected_state.registers.len()
+            );
+            if verbose {
+                print_state_stderr("expected", expected_state);
+            }
+        }
+        if let Some(actual_state) = &diff.actual_state_before {
+            eprintln!(
+                "actual state before:   #{} {} pc={} line={:?} registers={}",
+                actual_state.event_index,
+                actual_state.function,
+                actual_state.pc,
+                actual_state.source_line,
+                actual_state.registers.len()
+            );
+            if verbose {
+                print_state_stderr("actual", actual_state);
+            }
+        }
+    }
+}
+
+fn print_state_stderr(label: &str, state: &TraceState) {
+    eprintln!("{label} registers:");
+    for (register, value) in &state.registers {
+        eprintln!("  r{} = {}", register, render_value(value));
+    }
+    if let Some(capability) = &state.last_capability {
+        eprintln!(
+            "{label} last capability: {} {:?} -> {}",
+            capability.id,
+            capability.decision,
+            render_value(&capability.result)
+        );
+    }
+    if let Some(error) = &state.error {
+        eprintln!("{label} error: {error}");
     }
 }
 
@@ -419,27 +490,21 @@ fn print_debug_header(trace: &Trace) {
         trace.events.len(),
         trace.checksum
     );
-    println!("commands: next, prev, jump N, regs, caps, event, source, help, quit");
+    println!(
+        "commands: next, prev, back N, forward N, jump N, state, regs, caps, diff A B, slice A B, export-slice A B --out file, why, event, source, help, quit"
+    );
 }
 
 struct DebugState {
     index: usize,
-    registers_by_event: Vec<BTreeMap<usize, Value>>,
+    navigator: TraceNavigator,
 }
 
 impl DebugState {
     fn new(trace: &Trace) -> Self {
-        let mut registers = BTreeMap::new();
-        let mut registers_by_event = Vec::new();
-        for event in &trace.events {
-            for change in &event.register_changes {
-                registers.insert(change.register, change.value.clone());
-            }
-            registers_by_event.push(registers.clone());
-        }
         Self {
             index: 0,
-            registers_by_event,
+            navigator: TraceNavigator::new(trace.clone()),
         }
     }
 
@@ -459,6 +524,16 @@ impl DebugState {
                 self.index = self.index.saturating_sub(1);
                 self.print_current(trace);
             }
+            "back" => {
+                let amount = parse_optional_amount(parts.next())?;
+                self.index = self.index.saturating_sub(amount);
+                self.print_current(trace);
+            }
+            "forward" => {
+                let amount = parse_optional_amount(parts.next())?;
+                self.index = (self.index + amount).min(trace.events.len() - 1);
+                self.print_current(trace);
+            }
             "j" | "jump" => {
                 let Some(index) = parts.next() else {
                     anyhow::bail!("jump expects an event index");
@@ -470,8 +545,41 @@ impl DebugState {
                 self.index = index;
                 self.print_current(trace);
             }
+            "state" => self.print_state()?,
             "r" | "regs" => self.print_registers(),
             "c" | "caps" => self.print_caps(trace),
+            "diff" => {
+                let from = parse_required_index(parts.next(), "diff expects from index")?;
+                let to = parse_required_index(parts.next(), "diff expects to index")?;
+                self.print_diff(from, to)?;
+            }
+            "slice" => {
+                let from = parse_required_index(parts.next(), "slice expects from index")?;
+                let to = parse_required_index(parts.next(), "slice expects to index")?;
+                self.print_slice(from, to)?;
+            }
+            "export-slice" => {
+                let from = parse_required_index(parts.next(), "export-slice expects from index")?;
+                let to = parse_required_index(parts.next(), "export-slice expects to index")?;
+                let flag = parts.next().unwrap_or_default();
+                if flag != "--out" {
+                    anyhow::bail!("export-slice expects --out path");
+                }
+                let Some(path) = parts.next() else {
+                    anyhow::bail!("export-slice expects output path");
+                };
+                let sliced = trace.slice(from, to)?;
+                fs::write(path, serde_json::to_vec_pretty(&sliced)?)?;
+                println!(
+                    "exported {} events {}..={} to {} checksum {}",
+                    sliced.events.len(),
+                    from,
+                    to,
+                    path,
+                    sliced.checksum
+                );
+            }
+            "why" => self.print_why(trace)?,
             "e" | "event" => println!("{:#?}", trace.events[self.index]),
             "s" | "source" => self.print_source(trace),
             "h" | "help" => print_debug_header(trace),
@@ -510,16 +618,17 @@ impl DebugState {
     }
 
     fn print_registers(&self) {
-        let Some(registers) = self.registers_by_event.get(self.index) else {
+        let Ok(state) = self.navigator.state_at(self.index) else {
             return;
         };
+        let registers = state.registers;
         if registers.is_empty() {
             println!("registers: <empty>");
             return;
         }
         println!("registers:");
         for (register, value) in registers {
-            println!("  r{} = {}", register, render_value(value));
+            println!("  r{} = {}", register, render_value(&value));
         }
     }
 
@@ -553,6 +662,184 @@ impl DebugState {
             "{} pc={} line={:?} op={}",
             event.function, event.pc, event.source_line, event.opcode
         );
+        for source in self
+            .navigator
+            .source_window(self.index, 2)
+            .unwrap_or_default()
+        {
+            let marker = if source.event_index == self.index {
+                ">"
+            } else {
+                " "
+            };
+            println!(
+                "{marker} #{} {} pc={} line={:?} op={}",
+                source.event_index, source.function, source.pc, source.source_line, source.opcode
+            );
+        }
+    }
+
+    fn print_state(&self) -> Result<()> {
+        let state = self.navigator.state_at(self.index)?;
+        println!(
+            "state #{} {} pc={} line={:?}",
+            state.event_index, state.function, state.pc, state.source_line
+        );
+        print_state_registers(&state);
+        if let Some(capability) = &state.last_capability {
+            println!(
+                "last capability: {} {:?} -> {}",
+                capability.id,
+                capability.decision,
+                render_value(&capability.result)
+            );
+        }
+        if let Some(error) = &state.error {
+            println!("error: {error}");
+        }
+        Ok(())
+    }
+
+    fn print_diff(&self, from: usize, to: usize) -> Result<()> {
+        let diff = self.navigator.diff_between(from, to)?;
+        print_state_diff(&diff);
+        Ok(())
+    }
+
+    fn print_slice(&self, from: usize, to: usize) -> Result<()> {
+        let sliced = self.navigator.trace().slice(from, to)?;
+        println!(
+            "slice {}..={} events={} checksum={}",
+            from,
+            to,
+            sliced.events.len(),
+            sliced.checksum
+        );
+        for (offset, event) in sliced.events.iter().enumerate() {
+            println!(
+                "  #{} {} pc={} line={:?} op={} changes={}{}",
+                from + offset,
+                event.function,
+                event.pc,
+                event.source_line,
+                event.opcode,
+                event.register_changes.len(),
+                event
+                    .capability
+                    .as_ref()
+                    .map(|capability| format!(" cap={}", capability.id))
+                    .unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    fn print_why(&self, trace: &Trace) -> Result<()> {
+        let event = &trace.events[self.index];
+        println!(
+            "why #{}: {} pc={} line={:?} op={} checksum={}",
+            self.index, event.function, event.pc, event.source_line, event.opcode, event.checksum
+        );
+        if self.index > 0 {
+            let previous = &trace.events[self.index - 1];
+            println!(
+                "previous: #{} {} pc={} line={:?} op={}",
+                self.index - 1,
+                previous.function,
+                previous.pc,
+                previous.source_line,
+                previous.opcode
+            );
+        }
+        if event.register_changes.is_empty() {
+            println!("changed registers: <none>");
+        } else {
+            println!("changed registers:");
+            for change in &event.register_changes {
+                println!("  r{} = {}", change.register, render_value(&change.value));
+            }
+        }
+        if let Some(capability) = &event.capability {
+            println!(
+                "capability: {} {:?} args=[{}] -> {}",
+                capability.id,
+                capability.decision,
+                capability
+                    .args
+                    .iter()
+                    .map(render_value)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                render_value(&capability.result)
+            );
+        }
+        if let Some(error) = &event.error {
+            println!("error: {error}");
+        }
+        Ok(())
+    }
+}
+
+fn parse_optional_amount(value: Option<&str>) -> Result<usize> {
+    value
+        .unwrap_or("1")
+        .parse::<usize>()
+        .context("invalid amount")
+}
+
+fn parse_required_index(value: Option<&str>, message: &str) -> Result<usize> {
+    value
+        .ok_or_else(|| anyhow!(message.to_string()))?
+        .parse::<usize>()
+        .context("invalid event index")
+}
+
+fn print_state_registers(state: &TraceState) {
+    if state.registers.is_empty() {
+        println!("registers: <empty>");
+        return;
+    }
+    println!("registers:");
+    for (register, value) in &state.registers {
+        println!("  r{} = {}", register, render_value(value));
+    }
+}
+
+fn print_state_diff(diff: &StateDiff) {
+    println!(
+        "diff {} -> {} function {} -> {} checksums={}",
+        diff.from,
+        diff.to,
+        diff.from_function,
+        diff.to_function,
+        diff.checksum_range.len()
+    );
+    if let Some(entered) = &diff.entered_function {
+        println!("entered function: {entered}");
+    }
+    if let Some(exited) = &diff.exited_function {
+        println!("exited function: {exited}");
+    }
+    if diff.changed_registers.is_empty() {
+        println!("changed registers: <none>");
+    } else {
+        println!("changed registers:");
+        for change in &diff.changed_registers {
+            println!("  r{} = {}", change.register, render_value(&change.value));
+        }
+    }
+    if diff.capability_calls.is_empty() {
+        println!("capability calls: <none>");
+    } else {
+        println!("capability calls:");
+        for capability in &diff.capability_calls {
+            println!(
+                "  {} {:?} -> {}",
+                capability.id,
+                capability.decision,
+                render_value(&capability.result)
+            );
+        }
     }
 }
 

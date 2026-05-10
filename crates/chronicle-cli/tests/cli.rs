@@ -61,7 +61,9 @@ fn trace_inspect_and_replay_work() {
         .arg("debug")
         .arg(&trace)
         .arg("--commands")
-        .arg("source;next;regs;caps;jump 7;event;quit")
+        .arg(
+            "source;next;regs;caps;jump 7;state;back 2;forward 1;diff 1 7;slice 1 3;why;event;quit",
+        )
         .output()
         .unwrap();
     assert!(debug.status.success());
@@ -71,6 +73,10 @@ fn trace_inspect_and_replay_work() {
     assert!(debug_stdout.contains("registers:"));
     assert!(debug_stdout.contains("log.print@1"));
     assert!(debug_stdout.contains("pc=7"));
+    assert!(debug_stdout.contains("state #"));
+    assert!(debug_stdout.contains("diff 1 -> 7"));
+    assert!(debug_stdout.contains("slice 1..=3"));
+    assert!(debug_stdout.contains("why #"));
     let _ = std::fs::remove_file(trace);
 }
 
@@ -114,6 +120,27 @@ fn audit_demo_and_resource_limit_work() {
     let replay_stdout = String::from_utf8(replay.stdout).unwrap();
     assert!(replay_stdout.contains("replayed"));
 
+    let slice = std::env::temp_dir().join(format!(
+        "chronicle-audit-slice-{}.ctrace",
+        std::process::id()
+    ));
+    let slice_output = chronicle()
+        .arg("trace-slice")
+        .arg(&trace)
+        .arg("--from")
+        .arg("15")
+        .arg("--to")
+        .arg("35")
+        .arg("--out")
+        .arg(&slice)
+        .output()
+        .unwrap();
+    assert!(slice_output.status.success());
+    let inspect_slice = chronicle().arg("inspect").arg(&slice).output().unwrap();
+    assert!(inspect_slice.status.success());
+    let inspect_stdout = String::from_utf8(inspect_slice.stdout).unwrap();
+    assert!(inspect_stdout.contains("events: 21"));
+
     let limited = chronicle()
         .arg("run")
         .arg(root.join("examples/audit-plugin.chr"))
@@ -127,4 +154,5 @@ fn audit_demo_and_resource_limit_work() {
     let stderr = String::from_utf8(limited.stderr).unwrap();
     assert!(stderr.contains("instruction budget"));
     let _ = std::fs::remove_file(trace);
+    let _ = std::fs::remove_file(slice);
 }
