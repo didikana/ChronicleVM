@@ -11,6 +11,7 @@ Formal specs:
 - [Verifier](docs/verifier.md)
 - [Trace and replay](docs/trace-replay.md)
 - [Capabilities](docs/capabilities.md)
+- [Security model](docs/security.md)
 - [Benchmarks](docs/benchmarks.md)
 
 ## Workspace
@@ -104,6 +105,22 @@ The demo plugin is `examples/embedded-plugin.chr`. It uses custom app
 capabilities (`kv.get@1`, `kv.set@1`, `audit.emit@1`) plus the built-ins. Live
 custom capabilities are called only while recording the trace; replay uses the
 recorded capability results and does not invoke the host.
+
+## Security Demo
+
+`examples/malicious-plugin.chr` intentionally loops forever. ChronicleVM stops
+it with a deterministic instruction budget instead of letting the plugin run
+unbounded:
+
+```sh
+cargo run -p chronicle-cli -- run examples/malicious-plugin.chr \
+  --policy examples/policy.toml \
+  --max-instructions 25
+```
+
+The expected result is a resource-limit error containing `instruction budget`.
+For malformed binary modules, the core decoder returns structured errors rather
+than panicking; those cases are covered by `cargo test`.
 
 ## Assembly Sketch
 

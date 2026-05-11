@@ -1,0 +1,11 @@
+module malicious_plugin
+cap log.print@1(any...) -> nil "attempt visible output before resource limit"
+
+fn main
+  print("malicious plugin entered")
+  let counter = 0
+  while 1
+    let counter = counter + 1
+  end
+  return counter
+end

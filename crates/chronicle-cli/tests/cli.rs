@@ -156,3 +156,20 @@ fn audit_demo_and_resource_limit_work() {
     let _ = std::fs::remove_file(trace);
     let _ = std::fs::remove_file(slice);
 }
+
+#[test]
+fn malicious_demo_is_stopped_by_resource_limit() {
+    let root = repo_root();
+    let output = chronicle()
+        .arg("run")
+        .arg(root.join("examples/malicious-plugin.chr"))
+        .arg("--policy")
+        .arg(root.join("examples/policy.toml"))
+        .arg("--max-instructions")
+        .arg("25")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("instruction budget"));
+}

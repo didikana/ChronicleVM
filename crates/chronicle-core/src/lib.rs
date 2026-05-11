@@ -2385,6 +2385,78 @@ mod tests {
         }
     }
 
+    fn simple_module(code: Vec<Instruction>) -> Module {
+        Module {
+            name: "simple".into(),
+            constants: vec![Value::I64(1), Value::String("value".into())],
+            capabilities: vec![],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 3,
+                arity: 0,
+                source_lines: vec![Some(1); code.len()],
+                code,
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        }
+    }
+
+    fn verify_kind(module: Module) -> VerifyErrorKind {
+        match Verifier::verify(&module).unwrap_err() {
+            ChronicleError::Verify(err) => err.kind,
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    fn malformed_module_bytes() -> Vec<Vec<u8>> {
+        let module = Module {
+            name: "fuzz".into(),
+            constants: vec![Value::I64(7), Value::String("needle".into())],
+            capabilities: vec![cap("log.print@1")],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 2,
+                arity: 0,
+                code: vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 1,
+                    },
+                    Instruction::CapCall {
+                        dst: 1,
+                        capability: "log.print@1".into(),
+                        args: vec![0],
+                    },
+                    Instruction::Ret { src: 0 },
+                ],
+                source_lines: vec![Some(1), Some(2), Some(3)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let valid = module.to_bytes().unwrap();
+        let mut cases = Vec::new();
+
+        for len in 0..valid.len().min(48) {
+            cases.push(valid[..len].to_vec());
+        }
+
+        let mut old = Vec::from(OLD_MODULE_MAGIC.as_slice());
+        old.extend_from_slice(&[0, 0, 0, 0]);
+        cases.push(old);
+        cases.push(b"not a module".to_vec());
+
+        for index in 0..valid.len() {
+            let mut mutated = valid.clone();
+            mutated[index] = mutated[index].wrapping_add((index as u8).wrapping_mul(17) | 1);
+            cases.push(mutated);
+        }
+
+        let mut trailing = valid;
+        trailing.push(1);
+        cases.push(trailing);
+        cases
+    }
+
     #[test]
     fn verifies_register_bounds() {
         let module = Module {
@@ -2410,6 +2482,116 @@ mod tests {
             }
             other => panic!("unexpected error {other:?}"),
         }
+    }
+
+    #[test]
+    fn verifier_rejects_missing_export() {
+        let mut module = simple_module(vec![Instruction::Ret { src: 0 }]);
+        module.exports.insert("bad".into(), 99);
+        assert_eq!(verify_kind(module), VerifyErrorKind::MissingExport);
+    }
+
+    #[test]
+    fn verifier_rejects_source_map_mismatch() {
+        let mut module = simple_module(vec![Instruction::Ret { src: 0 }]);
+        module.functions[0].source_lines.push(Some(2));
+        assert_eq!(verify_kind(module), VerifyErrorKind::SourceMapMismatch);
+    }
+
+    #[test]
+    fn verifier_rejects_invalid_jump_target() {
+        let module = simple_module(vec![Instruction::Jump { target: 5 }]);
+        assert_eq!(verify_kind(module), VerifyErrorKind::InvalidJumpTarget);
+    }
+
+    #[test]
+    fn verifier_rejects_constant_bounds() {
+        let module = simple_module(vec![Instruction::Const {
+            dst: 0,
+            constant: 99,
+        }]);
+        assert_eq!(verify_kind(module), VerifyErrorKind::ConstantOutOfBounds);
+    }
+
+    #[test]
+    fn verifier_rejects_missing_callee_and_arity_mismatch() {
+        let missing = simple_module(vec![Instruction::Call {
+            dst: 0,
+            function: "missing".into(),
+            args: vec![],
+        }]);
+        assert_eq!(verify_kind(missing), VerifyErrorKind::MissingCallee);
+
+        let mut arity = simple_module(vec![Instruction::Call {
+            dst: 0,
+            function: "helper".into(),
+            args: vec![],
+        }]);
+        arity.functions.push(Function {
+            name: "helper".into(),
+            registers: 2,
+            arity: 1,
+            code: vec![Instruction::Ret { src: 0 }],
+            source_lines: vec![Some(1)],
+        });
+        assert_eq!(verify_kind(arity), VerifyErrorKind::ArityMismatch);
+    }
+
+    #[test]
+    fn verifier_rejects_undeclared_and_bad_signature_capabilities() {
+        let undeclared = simple_module(vec![Instruction::CapCall {
+            dst: 0,
+            capability: "network.open@1".into(),
+            args: vec![],
+        }]);
+        assert_eq!(
+            verify_kind(undeclared),
+            VerifyErrorKind::UndeclaredCapability
+        );
+
+        let mut bad_builtin = simple_module(vec![Instruction::Ret { src: 0 }]);
+        bad_builtin.capabilities.push(CapabilityDecl {
+            id: "clock.now@1".into(),
+            params: vec![ValueType::String],
+            return_type: ValueType::String,
+            reason: None,
+        });
+        assert_eq!(
+            verify_kind(bad_builtin),
+            VerifyErrorKind::CapabilitySignatureMismatch
+        );
+
+        let mut bad_variadic = simple_module(vec![Instruction::Ret { src: 0 }]);
+        bad_variadic.capabilities.push(custom_cap(
+            "audit.emit@1",
+            vec![ValueType::AnyVariadic, ValueType::String],
+            ValueType::Nil,
+        ));
+        assert_eq!(
+            verify_kind(bad_variadic),
+            VerifyErrorKind::CapabilitySignatureMismatch
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_type_mismatch_in_capability_args() {
+        let mut module = simple_module(vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::CapCall {
+                dst: 1,
+                capability: "kv.get@1".into(),
+                args: vec![0],
+            },
+        ]);
+        module.capabilities.push(custom_cap(
+            "kv.get@1",
+            vec![ValueType::String],
+            ValueType::Any,
+        ));
+        assert_eq!(verify_kind(module), VerifyErrorKind::TypeMismatch);
     }
 
     #[test]
@@ -2479,6 +2661,100 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("instruction budget"));
+    }
+
+    #[test]
+    fn call_depth_limit_is_recorded_in_trace() {
+        let module = Module {
+            name: "recursive".into(),
+            constants: vec![],
+            capabilities: vec![],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 1,
+                arity: 0,
+                code: vec![
+                    Instruction::Call {
+                        dst: 0,
+                        function: "main".into(),
+                        args: vec![],
+                    },
+                    Instruction::Ret { src: 0 },
+                ],
+                source_lines: vec![Some(1), Some(2)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let mut vm = Vm::new(module, HostPolicy::default())
+            .unwrap()
+            .with_limits(VmLimits {
+                max_call_depth: Some(2),
+                ..VmLimits::default()
+            });
+        let trace = vm.run_with_trace("main").unwrap();
+        assert!(trace.error.unwrap().contains("call depth"));
+        assert!(trace.events.iter().any(|event| event
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("call depth"))));
+    }
+
+    #[test]
+    fn register_limit_is_recorded_in_trace() {
+        let module = simple_module(vec![Instruction::Ret { src: 0 }]);
+        let mut vm = Vm::new(module, HostPolicy::default())
+            .unwrap()
+            .with_limits(VmLimits {
+                max_registers: Some(2),
+                ..VmLimits::default()
+            });
+        let trace = vm.run_with_trace("main").unwrap();
+        assert!(trace.error.unwrap().contains("registers"));
+        assert_eq!(trace.events.len(), 0);
+    }
+
+    #[test]
+    fn array_size_limit_is_recorded_in_trace() {
+        let module = Module {
+            name: "array-limit".into(),
+            constants: vec![Value::I64(1)],
+            capabilities: vec![],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 4,
+                arity: 0,
+                code: vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::Const {
+                        dst: 1,
+                        constant: 0,
+                    },
+                    Instruction::ArrayNew {
+                        dst: 2,
+                        items: vec![0, 1],
+                    },
+                    Instruction::Ret { src: 2 },
+                ],
+                source_lines: vec![Some(1), Some(2), Some(3), Some(4)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let mut vm = Vm::new(module, HostPolicy::default())
+            .unwrap()
+            .with_limits(VmLimits {
+                max_array_items: Some(1),
+                ..VmLimits::default()
+            });
+        let trace = vm.run_with_trace("main").unwrap();
+        assert!(trace.error.unwrap().contains("array_new requested"));
+        assert!(trace.events[2]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("array_new requested"));
     }
 
     #[test]
@@ -2719,6 +2995,62 @@ mod tests {
     fn truncated_binary_is_rejected() {
         let bytes = Vec::from(MODULE_MAGIC.as_slice());
         assert!(Module::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn malformed_binary_inputs_never_panic() {
+        for bytes in malformed_module_bytes() {
+            let result = std::panic::catch_unwind(|| Module::from_bytes(&bytes));
+            assert!(result.is_ok(), "Module::from_bytes panicked for {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn corrupted_binary_tags_are_structured_errors() {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn push_string(bytes: &mut Vec<u8>, value: &str) {
+            push_u32(bytes, value.len() as u32);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+
+        let mut invalid_value = Vec::from(MODULE_MAGIC.as_slice());
+        push_string(&mut invalid_value, "bad-value");
+        push_u32(&mut invalid_value, 1);
+        invalid_value.push(255);
+        assert!(matches!(
+            Module::from_bytes(&invalid_value),
+            Err(ChronicleError::Decode(message)) if message.contains("unknown value tag")
+        ));
+
+        let mut invalid_type = Vec::from(MODULE_MAGIC.as_slice());
+        push_string(&mut invalid_type, "bad-type");
+        push_u32(&mut invalid_type, 0);
+        push_u32(&mut invalid_type, 1);
+        push_string(&mut invalid_type, "custom.echo@1");
+        push_u32(&mut invalid_type, 1);
+        invalid_type.push(255);
+        assert!(matches!(
+            Module::from_bytes(&invalid_type),
+            Err(ChronicleError::Decode(message)) if message.contains("unknown value type tag")
+        ));
+
+        let mut invalid_instruction = Vec::from(MODULE_MAGIC.as_slice());
+        push_string(&mut invalid_instruction, "bad-instruction");
+        push_u32(&mut invalid_instruction, 0);
+        push_u32(&mut invalid_instruction, 0);
+        push_u32(&mut invalid_instruction, 1);
+        push_string(&mut invalid_instruction, "main");
+        push_u32(&mut invalid_instruction, 1);
+        push_u32(&mut invalid_instruction, 0);
+        push_u32(&mut invalid_instruction, 1);
+        invalid_instruction.push(255);
+        assert!(matches!(
+            Module::from_bytes(&invalid_instruction),
+            Err(ChronicleError::Decode(message)) if message.contains("unknown instruction tag")
+        ));
     }
 
     #[test]
