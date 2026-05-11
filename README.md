@@ -15,10 +15,11 @@ Formal specs:
 
 ## Workspace
 
-- `chronicle-core`: bytecode model, verifier, runtime, capabilities, trace replay.
+- `chronicle-core`: bytecode model, verifier, runtime, host SDK, capabilities, trace replay.
 - `chronicle-asm`: text assembly parser for `.casm` modules.
 - `chronicle-lang`: high-level `.chr` language compiler.
 - `chronicle-cli`: `chronicle` command line runner.
+- `chronicle-embed-demo`: small Rust app embedding ChronicleVM with custom host capabilities.
 
 ## Try It
 
@@ -57,6 +58,52 @@ python3 -m http.server 4173 --directory tools/trace-viewer
 ```
 
 Then visit `http://localhost:4173` and open `/tmp/audit.ctrace`.
+
+## Embedding ChronicleVM
+
+ChronicleVM can be embedded as a Rust safe-plugin runtime. Apps create a
+`HostRegistry`, keep the built-ins they want, register app-owned capabilities
+with typed signatures, negotiate a plugin policy, and then run or trace the VM.
+
+```rust
+use chronicle_core::{
+    CapabilityDecl, CapabilityDecision, HostPolicy, HostRegistry, Value, ValueType, Vm,
+};
+use std::collections::BTreeMap;
+
+let mut host = HostRegistry::with_builtins();
+host.insert(
+    CapabilityDecl {
+        id: "audit.emit@1".into(),
+        params: vec![ValueType::AnyVariadic],
+        return_type: ValueType::Nil,
+        reason: Some("emit an app audit event".into()),
+    },
+    |args| {
+        println!("audit event: {args:?}");
+        Ok(Value::Nil)
+    },
+)?;
+
+let policy = HostPolicy {
+    decisions: BTreeMap::from([("audit.emit@1".into(), CapabilityDecision::Grant)]),
+};
+let mut vm = Vm::new_with_host(module, policy, host)?;
+let trace = vm.run_with_trace("main")?;
+```
+
+Run the full embedding demo:
+
+```sh
+cargo run -p chronicle-embed-demo
+cargo run -p chronicle-cli -- inspect /tmp/embedded-plugin.ctrace
+cargo run -p chronicle-cli -- replay /tmp/embedded-plugin.ctrace
+```
+
+The demo plugin is `examples/embedded-plugin.chr`. It uses custom app
+capabilities (`kv.get@1`, `kv.set@1`, `audit.emit@1`) plus the built-ins. Live
+custom capabilities are called only while recording the trace; replay uses the
+recorded capability results and does not invoke the host.
 
 ## Assembly Sketch
 

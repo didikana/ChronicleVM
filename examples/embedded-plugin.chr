@@ -1,0 +1,20 @@
+module embedded_plugin
+cap log.print@1(any...) -> nil "print embedding demo output"
+cap clock.now@1() -> i64 "deterministic embedding timestamp"
+cap random.u64@1() -> i64 "deterministic embedding request id"
+cap kv.get@1(string) -> any "read app-owned plugin state"
+cap kv.set@1(string, any) -> nil "write app-owned plugin state"
+cap audit.emit@1(any...) -> nil "record app audit events"
+
+fn main
+  let timestamp = cap clock.now@1()
+  let request = cap random.u64@1()
+  let previous = cap kv.get@1("last_request")
+
+  cap audit.emit@1("start", timestamp, request, previous)
+  cap kv.set@1("last_request", request)
+  print("embedded plugin", "request", request, "previous", previous)
+  cap audit.emit@1("finish", request)
+
+  return ["ok", timestamp, request, previous]
+end

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -1096,6 +1097,50 @@ fn validate_capability_decl(decl: &CapabilityDecl) -> Result<()> {
     Ok(())
 }
 
+fn capability_signatures_match(declared: &CapabilityDecl, hosted: &CapabilityDecl) -> bool {
+    declared.id == hosted.id
+        && declared.params == hosted.params
+        && declared.return_type == hosted.return_type
+}
+
+fn validate_capability_call(decl: &CapabilityDecl, args: &[Value]) -> Result<()> {
+    let fixed = if decl.is_variadic() {
+        decl.params.len() - 1
+    } else {
+        decl.params.len()
+    };
+    let arity_ok = if decl.is_variadic() {
+        args.len() >= fixed
+    } else {
+        args.len() == fixed
+    };
+    if !arity_ok {
+        return Err(ChronicleError::Runtime(format!(
+            "capability {} expects {}{} args, got {}",
+            decl.id,
+            fixed,
+            if decl.is_variadic() { "+" } else { "" },
+            args.len()
+        )));
+    }
+    for (index, arg) in args.iter().enumerate() {
+        let expected = if index < decl.params.len() {
+            &decl.params[index]
+        } else {
+            decl.params.last().unwrap_or(&ValueType::Any)
+        };
+        if !expected.accepts(arg) {
+            return Err(ChronicleError::Runtime(format!(
+                "capability {} arg {index} expects {:?}, got {:?}",
+                decl.id,
+                expected,
+                arg.value_type()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn verify_capability_args(
     function: &Function,
     pc: usize,
@@ -1165,6 +1210,15 @@ pub struct HostPolicy {
 
 impl HostPolicy {
     pub fn negotiate(&self, module: &Module) -> NegotiationReport {
+        let host = HostRegistry::with_builtins();
+        self.negotiate_with_host(module, &host)
+    }
+
+    pub fn negotiate_with_host(
+        &self,
+        module: &Module,
+        host: &dyn CapabilityHost,
+    ) -> NegotiationReport {
         let mut entries = Vec::new();
         for decl in &module.capabilities {
             let decision = self
@@ -1173,13 +1227,16 @@ impl HostPolicy {
                 .cloned()
                 .unwrap_or(CapabilityDecision::Deny);
             let status = match &decision {
-                CapabilityDecision::Grant => {
-                    if builtin_signature(&decl.id).is_some() || !is_builtin_namespace(&decl.id) {
-                        NegotiationStatus::Granted
-                    } else {
-                        NegotiationStatus::Unknown
+                CapabilityDecision::Grant => match host.signature(&decl.id) {
+                    Some(signature) => {
+                        if capability_signatures_match(decl, &signature) {
+                            NegotiationStatus::Granted
+                        } else {
+                            NegotiationStatus::TypeInvalid
+                        }
                     }
-                }
+                    None => NegotiationStatus::Unknown,
+                },
                 CapabilityDecision::Mock(value) => {
                     if !decl.return_type.accepts(value) {
                         NegotiationStatus::TypeInvalid
@@ -1242,7 +1299,7 @@ impl NegotiationReport {
                     return Err(PolicyError::new(
                         PolicyErrorKind::MockTypeMismatch,
                         entry.capability,
-                        "mock value does not match declared return type",
+                        "mock value or host signature does not match capability declaration",
                     )
                     .into());
                 }
@@ -1268,6 +1325,113 @@ pub enum NegotiationStatus {
     Denied,
     Unknown,
     TypeInvalid,
+}
+
+pub trait CapabilityHost: Send + Sync {
+    fn signature(&self, id: &str) -> Option<CapabilityDecl>;
+    fn call(&self, id: &str, args: &[Value]) -> Result<Value>;
+}
+
+type CapabilityHandler = dyn Fn(&[Value]) -> Result<Value> + Send + Sync;
+
+#[derive(Clone)]
+struct RegisteredCapability {
+    decl: CapabilityDecl,
+    handler: Arc<CapabilityHandler>,
+}
+
+#[derive(Clone, Default)]
+pub struct HostRegistry {
+    entries: BTreeMap<String, RegisteredCapability>,
+}
+
+impl std::fmt::Debug for HostRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostRegistry")
+            .field("capabilities", &self.entries.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl HostRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_builtins() -> Self {
+        let mut host = Self::new();
+        for id in ["log.print@1", "clock.now@1", "random.u64@1"] {
+            let decl = builtin_signature(id).expect("built-in capability signature");
+            host.insert_fn(decl, builtin_capability);
+        }
+        host
+    }
+
+    pub fn insert(
+        &mut self,
+        decl: CapabilityDecl,
+        handler: impl Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
+    ) -> Result<()> {
+        validate_capability_decl(&decl)?;
+        let id = decl.id.clone();
+        let handler = Arc::new(handler);
+        self.entries
+            .insert(id, RegisteredCapability { decl, handler });
+        Ok(())
+    }
+
+    pub fn insert_fn(
+        &mut self,
+        decl: CapabilityDecl,
+        handler: impl Fn(&str, &[Value]) -> Result<Value> + Send + Sync + 'static,
+    ) {
+        let id = decl.id.clone();
+        let call_id = id.clone();
+        self.entries.insert(
+            id,
+            RegisteredCapability {
+                decl,
+                handler: Arc::new(move |args| handler(&call_id, args)),
+            },
+        );
+    }
+
+    pub fn merge(&mut self, other: HostRegistry) {
+        self.entries.extend(other.entries);
+    }
+}
+
+impl CapabilityHost for HostRegistry {
+    fn signature(&self, id: &str) -> Option<CapabilityDecl> {
+        self.entries.get(id).map(|entry| entry.decl.clone())
+    }
+
+    fn call(&self, id: &str, args: &[Value]) -> Result<Value> {
+        let Some(entry) = self.entries.get(id) else {
+            return Err(PolicyError::new(
+                PolicyErrorKind::UnsupportedCapabilityVersion,
+                id,
+                "capability is not registered by host",
+            )
+            .into());
+        };
+        validate_capability_call(&entry.decl, args)?;
+        let value = (entry.handler)(args)?;
+        if !entry.decl.return_type.accepts(&value) {
+            return Err(PolicyError::new(
+                PolicyErrorKind::MockTypeMismatch,
+                id,
+                format!(
+                    "host returned {:?}, expected {:?}",
+                    value.value_type(),
+                    entry.decl.return_type
+                ),
+            )
+            .into());
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1545,10 +1709,11 @@ pub struct VmLimits {
     pub max_array_items: Option<usize>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Vm {
     module: Module,
     capabilities: BTreeMap<String, CapabilityDecision>,
+    host: Arc<dyn CapabilityHost>,
     replay_capabilities: Vec<CapabilityTrace>,
     replay_capability_index: usize,
     limits: VmLimits,
@@ -1556,14 +1721,39 @@ pub struct Vm {
     call_depth: usize,
 }
 
+impl std::fmt::Debug for Vm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Vm")
+            .field("module", &self.module.name)
+            .field(
+                "capabilities",
+                &self.capabilities.keys().collect::<Vec<_>>(),
+            )
+            .field("limits", &self.limits)
+            .field("instruction_count", &self.instruction_count)
+            .field("call_depth", &self.call_depth)
+            .finish()
+    }
+}
+
 impl Vm {
     pub fn new(module: Module, host_policy: HostPolicy) -> Result<Self> {
+        Self::new_with_host(module, host_policy, HostRegistry::with_builtins())
+    }
+
+    pub fn new_with_host<H>(module: Module, host_policy: HostPolicy, host: H) -> Result<Self>
+    where
+        H: CapabilityHost + 'static,
+    {
         Verifier::verify(&module)?;
-        let report = host_policy.negotiate(&module);
+        let host = Arc::new(host);
+        let report = host_policy.negotiate_with_host(&module, host.as_ref());
         let capabilities = report.into_capability_table()?;
         Ok(Self {
             module,
             capabilities,
+            host,
             replay_capabilities: Vec::new(),
             replay_capability_index: 0,
             limits: VmLimits::default(),
@@ -1622,9 +1812,11 @@ impl Vm {
         for decl in &trace.module.capabilities {
             capabilities.insert(decl.id.clone(), CapabilityDecision::Grant);
         }
+        let host = HostRegistry::with_builtins();
         let mut vm = Self {
             module: trace.module.clone(),
             capabilities,
+            host: Arc::new(host),
             replay_capabilities: capability_results,
             replay_capability_index: 0,
             limits: VmLimits::default(),
@@ -1958,7 +2150,7 @@ impl Vm {
         }
 
         match self.capabilities.get(name) {
-            Some(CapabilityDecision::Grant) => builtin_capability(name, &args),
+            Some(CapabilityDecision::Grant) => self.host.call(name, &args),
             Some(CapabilityDecision::Mock(value)) => Ok(value.clone()),
             Some(CapabilityDecision::Deny) | None => Err(PolicyError::new(
                 PolicyErrorKind::DeniedCapability,
@@ -2158,10 +2350,6 @@ pub fn builtin_signature(id: &str) -> Option<CapabilityDecl> {
     }
 }
 
-fn is_builtin_namespace(id: &str) -> bool {
-    id.starts_with("log.") || id.starts_with("clock.") || id.starts_with("random.")
-}
-
 fn display_value(value: &Value) -> String {
     match value {
         Value::Nil => "nil".into(),
@@ -2186,6 +2374,15 @@ mod tests {
 
     fn cap(id: &str) -> CapabilityDecl {
         builtin_signature(id).unwrap()
+    }
+
+    fn custom_cap(id: &str, params: Vec<ValueType>, return_type: ValueType) -> CapabilityDecl {
+        CapabilityDecl {
+            id: id.into(),
+            params,
+            return_type,
+            reason: Some("test custom capability".into()),
+        }
     }
 
     #[test]
@@ -2550,5 +2747,135 @@ mod tests {
             ChronicleError::Policy(err) => assert_eq!(err.kind, PolicyErrorKind::MockTypeMismatch),
             other => panic!("unexpected error {other:?}"),
         }
+    }
+
+    #[test]
+    fn custom_host_capability_runs_and_replays_without_host() {
+        let module = Module {
+            name: "custom-host".into(),
+            constants: vec![Value::String("answer".into())],
+            capabilities: vec![custom_cap(
+                "kv.get@1",
+                vec![ValueType::String],
+                ValueType::I64,
+            )],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 2,
+                arity: 0,
+                code: vec![
+                    Instruction::Const {
+                        dst: 0,
+                        constant: 0,
+                    },
+                    Instruction::CapCall {
+                        dst: 1,
+                        capability: "kv.get@1".into(),
+                        args: vec![0],
+                    },
+                    Instruction::Ret { src: 1 },
+                ],
+                source_lines: vec![Some(1), Some(2), Some(3)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_calls = std::sync::Arc::clone(&calls);
+        let mut host = HostRegistry::with_builtins();
+        host.insert(
+            custom_cap("kv.get@1", vec![ValueType::String], ValueType::I64),
+            move |_| {
+                handler_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Value::I64(42))
+            },
+        )
+        .unwrap();
+        let policy = HostPolicy {
+            decisions: BTreeMap::from([("kv.get@1".into(), CapabilityDecision::Grant)]),
+        };
+
+        let mut vm = Vm::new_with_host(module, policy, host).unwrap();
+        let trace = vm.run_with_trace("main").unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(trace.result, Some(Value::I64(42)));
+
+        let report = Vm::replay(trace).unwrap();
+        assert_eq!(report.result, Some(Value::I64(42)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn custom_host_signature_mismatch_fails_negotiation() {
+        let module = Module {
+            name: "custom-mismatch".into(),
+            constants: vec![],
+            capabilities: vec![custom_cap(
+                "kv.get@1",
+                vec![ValueType::String],
+                ValueType::I64,
+            )],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 1,
+                arity: 0,
+                code: vec![Instruction::Ret { src: 0 }],
+                source_lines: vec![Some(1)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let mut host = HostRegistry::new();
+        host.insert(
+            custom_cap("kv.get@1", vec![ValueType::String], ValueType::String),
+            |_| Ok(Value::String("bad".into())),
+        )
+        .unwrap();
+        let policy = HostPolicy {
+            decisions: BTreeMap::from([("kv.get@1".into(), CapabilityDecision::Grant)]),
+        };
+        let err = Vm::new_with_host(module, policy, host).unwrap_err();
+        match err {
+            ChronicleError::Policy(err) => assert_eq!(err.kind, PolicyErrorKind::MockTypeMismatch),
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_return_type_mismatch_is_recorded_in_trace() {
+        let module = Module {
+            name: "bad-host-return".into(),
+            constants: vec![],
+            capabilities: vec![custom_cap("audit.count@1", vec![], ValueType::I64)],
+            functions: vec![Function {
+                name: "main".into(),
+                registers: 1,
+                arity: 0,
+                code: vec![
+                    Instruction::CapCall {
+                        dst: 0,
+                        capability: "audit.count@1".into(),
+                        args: vec![],
+                    },
+                    Instruction::Ret { src: 0 },
+                ],
+                source_lines: vec![Some(1), Some(2)],
+            }],
+            exports: BTreeMap::from([("main".into(), 0)]),
+        };
+        let mut host = HostRegistry::new();
+        host.insert(custom_cap("audit.count@1", vec![], ValueType::I64), |_| {
+            Ok(Value::String("bad".into()))
+        })
+        .unwrap();
+        let policy = HostPolicy {
+            decisions: BTreeMap::from([("audit.count@1".into(), CapabilityDecision::Grant)]),
+        };
+        let mut vm = Vm::new_with_host(module, policy, host).unwrap();
+        let trace = vm.run_with_trace("main").unwrap();
+        assert!(trace.error.unwrap().contains("host returned"));
+        assert!(trace.events[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("host returned"));
     }
 }

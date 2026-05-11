@@ -4,6 +4,7 @@ members = [
     "crates/chronicle-asm",
     "crates/chronicle-lang",
     "crates/chronicle-cli",
+    "crates/chronicle-embed-demo",
 ]
 resolver = "2"
 

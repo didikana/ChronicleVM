@@ -130,6 +130,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronicle-embed-demo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chronicle-core",
+ "chronicle-lang",
+ "serde_json",
+]
+
+[[package]]
 name = "chronicle-lang"
 version = "0.1.0"
 dependencies = [
