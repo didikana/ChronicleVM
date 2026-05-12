@@ -6,6 +6,8 @@ use thiserror::Error;
 
 pub const MODULE_MAGIC: &[u8; 8] = b"CHVMOD2\0";
 const OLD_MODULE_MAGIC: &[u8; 8] = b"CHVMOD1\0";
+const MAX_BINARY_LIST_ITEMS: usize = 1_000_000;
+const MAX_BINARY_STRING_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ChronicleError {
@@ -776,7 +778,12 @@ impl<'a> BinaryModuleReader<'a> {
 
     fn read_many<T>(&mut self, mut read: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<T>> {
         let len = self.read_usize()?;
-        let mut values = Vec::with_capacity(len);
+        if len > MAX_BINARY_LIST_ITEMS {
+            return Err(ChronicleError::Decode(format!(
+                "binary list length {len} exceeds max {MAX_BINARY_LIST_ITEMS}"
+            )));
+        }
+        let mut values = Vec::new();
         for _ in 0..len {
             values.push(read(self)?);
         }
@@ -785,6 +792,11 @@ impl<'a> BinaryModuleReader<'a> {
 
     fn read_string(&mut self) -> Result<String> {
         let len = self.read_usize()?;
+        if len > MAX_BINARY_STRING_BYTES {
+            return Err(ChronicleError::Decode(format!(
+                "binary string length {len} exceeds max {MAX_BINARY_STRING_BYTES}"
+            )));
+        }
         let bytes = self.take(len)?;
         String::from_utf8(bytes.to_vec()).map_err(|err| ChronicleError::Decode(err.to_string()))
     }
