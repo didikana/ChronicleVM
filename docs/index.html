@@ -29,10 +29,11 @@
       <section class="hero">
         <div class="hero-copy">
           <p class="eyebrow">Rust systems/security project</p>
-          <h1>Replayable sandboxing for safe plugins.</h1>
+          <h1>ChronicleVM</h1>
+          <p class="hero-title">Replayable sandboxing for safe plugins.</p>
           <p class="lede">
-            ChronicleVM is a Rust VM that runs plugins through typed capability
-            negotiation, records provenance-rich traces, and replays executions
+            A Rust VM that runs plugins through typed capability negotiation,
+            records provenance-rich traces, and replays executions
             deterministically for audit and debugging.
           </p>
           <div class="hero-actions">
@@ -51,6 +52,10 @@
             <div>
               <dt>Evidence</dt>
               <dd>Trace replay</dd>
+            </div>
+            <div>
+              <dt>Hardening</dt>
+              <dd>Property tests</dd>
             </div>
           </dl>
         </div>
@@ -88,6 +93,27 @@ capabilities:
               <li><span>#20</span><strong>jump_if risk &lt;= threshold</strong><em>replayable</em></li>
             </ol>
           </div>
+        </div>
+      </section>
+
+      <section class="recruiter-panel" aria-label="Recruiter summary">
+        <div>
+          <p class="eyebrow">Recruiter snapshot</p>
+          <h2>What this project demonstrates.</h2>
+        </div>
+        <div class="recruiter-grid">
+          <article>
+            <strong>Systems design</strong>
+            <span>Custom bytecode, verifier, VM runtime, trace format, and replay engine.</span>
+          </article>
+          <article>
+            <strong>Security thinking</strong>
+            <span>Explicit threat model, deny-by-default powers, bounded execution, malformed input hardening.</span>
+          </article>
+          <article>
+            <strong>Product polish</strong>
+            <span>CLI workflow, browser trace viewer, embeddable SDK, docs, CI, and benchmark checks.</span>
+          </article>
         </div>
       </section>
 
@@ -172,8 +198,8 @@ cargo run -p chronicle-cli -- debug /tmp/audit.ctrace \
 
     <footer class="site-footer">
       <span>ChronicleVM</span>
-      <a href="./security.html">Security model</a>
-      <a href="./trace-replay.html">Trace replay</a>
+      <a href="https://github.com/didikana/ChronicleVM/blob/main/docs/security.md">Security model</a>
+      <a href="https://github.com/didikana/ChronicleVM/blob/main/docs/trace-replay.md">Trace replay</a>
       <a href="https://github.com/didikana/ChronicleVM">GitHub</a>
     </footer>
   </body>
