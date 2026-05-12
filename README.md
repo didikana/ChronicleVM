@@ -10,6 +10,23 @@ and runaway plugins.
 
 [![CI](https://github.com/didikana/ChronicleVM/actions/workflows/ci.yml/badge.svg)](https://github.com/didikana/ChronicleVM/actions/workflows/ci.yml)
 
+## 90-Second Quickstart
+
+```sh
+git clone https://github.com/didikana/ChronicleVM && cd ChronicleVM
+cargo run -p chronicle-cli -- trace examples/audit-plugin.chr \
+  --policy examples/audit-policy.toml --out /tmp/audit.ctrace
+cargo run -p chronicle-cli -- audit /tmp/audit.ctrace
+```
+
+`audit: valid` confirms the trace is checksummed and replayable. Step through
+every instruction event in the browser:
+
+```sh
+python3 -m http.server 4173 --directory docs
+# Open http://localhost:4173/trace-viewer/ and load /tmp/audit.ctrace
+```
+
 ## Why It Exists
 
 Most plugin systems answer "did it run?" ChronicleVM answers more useful
@@ -206,7 +223,33 @@ The high-level language supports functions, parameters, calls, `if`/`else`,
 `while`, arrays, arithmetic, comparisons, boolean operators, capability calls,
 and `print(...)` sugar for `log.print@1`.
 
+## Why Not WASM?
+
+WebAssembly gives you portable sandboxing. ChronicleVM gives you *inspectable*
+sandboxing.
+
+- **Per-instruction event recording** with register snapshots — WASM does not
+  expose this
+- **Typed capability negotiation** before execution begins, not at import time
+- **Replay from a trace** without re-calling live host functions
+- **CLI debugger** that steps backward through recorded events
+- **Pure Rust library** — no JS runtime or browser dependency required
+
+## Why Deterministic Replay?
+
+"The plugin ran fine in CI" is not evidence when CI used live clocks and real
+randomness.
+
+- A production failure can be re-examined without reproducing original conditions
+- `chronicle audit` checksums the trace and re-runs it, verifying the same result
+- Capability values come from the recorded trace — not new calls to live hosts
+- The exact inputs, decisions, and outputs are preserved as auditable evidence
+
 ## Architecture
+
+**Execution flow:** `.chr` source → `chronicle-lang` compiler → bytecode
+(`.cmod`) → verifier → VM with capability gate (bounded by sandbox limits) →
+`.ctrace` trace file → `audit` / `replay` / `debug` / browser viewer.
 
 | Crate | Purpose |
 | --- | --- |

@@ -60,38 +60,23 @@
           </dl>
         </div>
 
-        <div class="hero-panel" aria-label="Trace audit preview">
-          <div class="terminal">
-            <div class="terminal-bar">
-              <span></span>
-              <span></span>
-              <span></span>
-              <strong>chronicle audit</strong>
+        <div class="hero-panel" aria-label="Step-through execution replay">
+          <div class="replay-widget">
+            <div class="replay-bar">
+              <span class="tl"><b></b><b></b><b></b></span>
+              <span class="replay-module">audit_plugin &middot; execution replay</span>
+              <div class="replay-nav">
+                <button type="button" id="rBack" aria-label="Previous step">&#8249;</button>
+                <button type="button" id="rPlay" aria-label="Play or pause">&#9208;</button>
+                <button type="button" id="rFwd" aria-label="Next step">&#8250;</button>
+              </div>
             </div>
-            <pre><code>$ chronicle audit /tmp/audit.ctrace
-audit: valid
-module: audit_plugin
-events: 39
-module digest: sha256:8d4f...
-policy digest: sha256:42b1...
-limits: max_instructions=100000
-capabilities:
-  clock.now@1: 1 mocked
-  random.u64@1: 1 mocked
-  log.print@1: 5 granted</code></pre>
-          </div>
-
-          <div class="trace-card">
-            <div class="trace-header">
-              <span>Trace timeline</span>
-              <strong>checksum verified</strong>
+            <ol class="replay-source" id="rSource"></ol>
+            <div class="replay-event-box" id="rEvent"></div>
+            <div class="replay-footer">
+              <div class="replay-dots" id="rDots"></div>
+              <a href="./trace-viewer/" class="replay-open">open full trace viewer &#8594;</a>
             </div>
-            <ol>
-              <li><span>#0</span><strong>cap_call clock.now@1</strong><em>mocked</em></li>
-              <li><span>#1</span><strong>cap_call random.u64@1</strong><em>mocked</em></li>
-              <li><span>#6</span><strong>cap_call log.print@1</strong><em>granted</em></li>
-              <li><span>#20</span><strong>jump_if risk &lt;= threshold</strong><em>replayable</em></li>
-            </ol>
           </div>
         </div>
       </section>
@@ -174,24 +159,86 @@ cargo run -p chronicle-cli -- debug /tmp/audit.ctrace \
         </div>
       </section>
 
-      <section id="architecture" class="section architecture">
+      <section class="section why-section">
         <div class="section-heading">
-          <p class="eyebrow">Architecture</p>
-          <h2>A compact workspace with a complete runtime story.</h2>
+          <p class="eyebrow">Design decisions</p>
+          <h2>Why these trade-offs.</h2>
         </div>
-        <div class="architecture-grid">
-          <article>
-            <h3>Core VM</h3>
-            <p>`chronicle-core` owns bytecode, verification, VM execution, trace replay, host SDK, and audit metadata.</p>
-          </article>
-          <article>
-            <h3>Language and assembly</h3>
-            <p>`chronicle-lang` compiles `.chr` source; `chronicle-asm` parses `.casm` modules for lower-level experiments.</p>
-          </article>
-          <article>
-            <h3>CLI and viewer</h3>
-            <p>`chronicle-cli` runs the workflow end to end. GitHub Pages hosts the trace viewer and project landing page.</p>
-          </article>
+        <div class="why-grid">
+          <div class="why-card">
+            <h3>Why not WASM?</h3>
+            <p>WebAssembly gives you portable sandboxing. ChronicleVM gives you <em>inspectable</em> sandboxing.</p>
+            <ul>
+              <li>Per-instruction event recording with register snapshots &mdash; WASM does not expose this</li>
+              <li>Typed capability negotiation before execution begins, not at import time</li>
+              <li>Replay from a recorded trace without re-calling live host functions</li>
+              <li>CLI debugger that steps backward through recorded events</li>
+              <li>Embeds as a pure Rust library &mdash; no JS runtime or browser dependency</li>
+            </ul>
+          </div>
+          <div class="why-card">
+            <h3>Why deterministic replay?</h3>
+            <p>"The plugin ran fine in CI" is not evidence when CI used live clocks and real randomness.</p>
+            <ul>
+              <li>Production failures can be re-examined without reproducing original conditions</li>
+              <li><code>chronicle audit</code> checksums the trace and re-runs it, verifying the same result</li>
+              <li>Capability values come from the recorded trace &mdash; not new calls to live hosts</li>
+              <li>The exact inputs, decisions, and outputs are preserved as auditable evidence</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="architecture" class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Execution lifecycle</p>
+          <h2>From source to auditable evidence.</h2>
+        </div>
+        <div class="pipeline">
+          <div class="pl-node">
+            <span class="pl-step">01</span>
+            <strong>.chr source</strong>
+            <span>High-level plugin language</span>
+          </div>
+          <span class="pl-arr" aria-hidden="true">&rarr;</span>
+          <div class="pl-node">
+            <span class="pl-step">02</span>
+            <strong>Compile + verify</strong>
+            <span>Bytecode &middot; structure checks</span>
+          </div>
+          <span class="pl-arr" aria-hidden="true">&rarr;</span>
+          <div class="pl-node pl-node--key">
+            <span class="pl-step">03</span>
+            <strong>VM + cap gate</strong>
+            <span>Bounded &middot; intercepted &middot; logged</span>
+          </div>
+          <span class="pl-arr" aria-hidden="true">&rarr;</span>
+          <div class="pl-node">
+            <span class="pl-step">04</span>
+            <strong>.ctrace file</strong>
+            <span>Events &middot; checksums &middot; provenance</span>
+          </div>
+          <span class="pl-arr" aria-hidden="true">&rarr;</span>
+          <div class="pl-tools">
+            <span>audit</span>
+            <span>replay</span>
+            <span>debug</span>
+            <span>viewer</span>
+          </div>
+        </div>
+        <div class="crate-row">
+          <div class="crate-card">
+            <code>chronicle-core</code>
+            <span>Bytecode model &middot; VM runtime &middot; trace &middot; replay &middot; host SDK</span>
+          </div>
+          <div class="crate-card">
+            <code>chronicle-lang</code> &nbsp;&middot;&nbsp; <code>chronicle-asm</code>
+            <span>High-level compiler &middot; assembly parser</span>
+          </div>
+          <div class="crate-card">
+            <code>chronicle-cli</code>
+            <span>run &middot; trace &middot; audit &middot; replay &middot; debug &middot; inspect</span>
+          </div>
         </div>
       </section>
     </main>
@@ -202,5 +249,112 @@ cargo run -p chronicle-cli -- debug /tmp/audit.ctrace \
       <a href="https://github.com/didikana/ChronicleVM/blob/main/docs/trace-replay.md">Trace replay</a>
       <a href="https://github.com/didikana/ChronicleVM">GitHub</a>
     </footer>
+  <script>
+    (function () {
+      var SRC = [
+        "module audit_plugin",
+        "cap clock.now@1() -> i64",
+        "cap random.u64@1() -> i64",
+        "cap log.print@1(any...) -> nil",
+        "",
+        "fn main",
+        "  let timestamp = cap clock.now@1()",
+        "  let request   = cap random.u64@1()",
+        "  let amount    = 640",
+        "  let risk      = risk_points(amount, 3)",
+        "  print(\"audit start\", timestamp, request)",
+        "  print(\"decision\", \"review\", amount)",
+        "  return [\"review\", timestamp, request, risk]",
+        "end",
+      ];
+
+      var STEPS = [
+        { line: 6, opcode: "cap_call", cap: { id: "clock.now@1", decision: "mocked", result: "1900000000" }, change: "r0 ← 1900000000" },
+        { line: 7, opcode: "cap_call", cap: { id: "random.u64@1", decision: "mocked", result: "424242" }, change: "r1 ← 424242" },
+        { line: 8, opcode: "load_const", cap: null, change: "r2 ← 640" },
+        { line: 9, opcode: "call risk_points", cap: null, change: "r3 ← 5" },
+        { line: 10, opcode: "cap_call", cap: { id: "log.print@1", decision: "granted", result: "nil" }, change: "" },
+        { line: 11, opcode: "cap_call", cap: { id: "log.print@1", decision: "granted", result: "nil" }, change: "" },
+        { line: 12, opcode: "ret", cap: null, change: "[\"review\", 1900000000, 424242, 5]" },
+      ];
+
+      var step = 0;
+      var playing = true;
+      var timer = null;
+
+      var rSource = document.getElementById("rSource");
+      var rEvent  = document.getElementById("rEvent");
+      var rDots   = document.getElementById("rDots");
+      var rPlay   = document.getElementById("rPlay");
+      var rBack   = document.getElementById("rBack");
+      var rFwd    = document.getElementById("rFwd");
+
+      if (!rSource || !rEvent || !rDots || !rPlay || !rBack || !rFwd) return;
+
+      function esc(s) {
+        return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+      }
+
+      function render() {
+        var s = STEPS[step];
+
+        var sourceHtml = "";
+        for (var i = 0; i < SRC.length; i++) {
+          var cls = i === s.line ? " class=\"active\"" : "";
+          sourceHtml += "<li" + cls + "><span class=\"ln\">" + (i + 1) + "</span><span class=\"lc\">" + esc(SRC[i]) + "</span></li>";
+        }
+        rSource.innerHTML = sourceHtml;
+
+        var eventHtml = "<div class=\"re-row\"><span>event</span><strong>#" + step + " · " + esc(s.opcode) + "</strong></div>";
+        if (s.cap) {
+          var dc = s.cap.decision === "mocked" ? "dec-mock" : s.cap.decision === "granted" ? "dec-grant" : "dec-deny";
+          eventHtml += "<div class=\"re-row\"><span>capability</span><strong>" + esc(s.cap.id) + " <span class=\"dec-badge " + dc + "\">" + esc(s.cap.decision) + "</span></strong></div>";
+          eventHtml += "<div class=\"re-row\"><span>result</span><strong>" + esc(s.cap.result) + "</strong></div>";
+        }
+        if (s.change) {
+          eventHtml += "<div class=\"re-row\"><span>registers</span><strong>" + esc(s.change) + "</strong></div>";
+        }
+        if (s.opcode === "ret") {
+          eventHtml += "<div class=\"re-row\"><span>checksum</span><strong class=\"dec-grant\">✓ verified</strong></div>";
+        }
+        rEvent.innerHTML = eventHtml;
+
+        var dotsHtml = "";
+        for (var j = 0; j < STEPS.length; j++) {
+          var c = "rdot" + (j === step ? " active" : "") + (STEPS[j].cap ? " has-cap" : "");
+          dotsHtml += "<span class=\"" + c + "\"></span>";
+        }
+        rDots.innerHTML = dotsHtml;
+
+        rPlay.innerHTML = playing ? "&#9208;" : "&#9654;";
+      }
+
+      function advance() { step = (step + 1) % STEPS.length; render(); }
+
+      function startTimer() { clearInterval(timer); timer = setInterval(advance, 1900); }
+      function stopTimer()  { clearInterval(timer); timer = null; }
+
+      rPlay.addEventListener("click", function () {
+        playing = !playing;
+        playing ? startTimer() : stopTimer();
+        rPlay.innerHTML = playing ? "&#9208;" : "&#9654;";
+      });
+      rBack.addEventListener("click", function () {
+        playing = false; stopTimer(); rPlay.innerHTML = "&#9654;";
+        step = (step - 1 + STEPS.length) % STEPS.length; render();
+      });
+      rFwd.addEventListener("click", function () {
+        playing = false; stopTimer(); rPlay.innerHTML = "&#9654;";
+        step = (step + 1) % STEPS.length; render();
+      });
+
+      document.addEventListener("visibilitychange", function () {
+        if (document.hidden) { stopTimer(); } else if (playing) { startTimer(); }
+      });
+
+      render();
+      startTimer();
+    }());
+  </script>
   </body>
 </html>
