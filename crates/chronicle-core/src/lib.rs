@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -1447,6 +1449,32 @@ impl CapabilityHost for HostRegistry {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TraceMetadata {
+    pub format_version: u32,
+    pub runtime_version: String,
+    pub module_digest: String,
+    pub policy_digest: Option<String>,
+    pub limits: VmLimits,
+    pub capabilities: BTreeMap<String, TraceCapabilityDecision>,
+    pub slice: Option<TraceSliceMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceCapabilityDecision {
+    Grant,
+    Mock,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceSliceMetadata {
+    pub from: usize,
+    pub to: usize,
+    pub source_event_count: usize,
+    pub source_checksum: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Trace {
     pub module: Module,
     pub entry: String,
@@ -1454,6 +1482,8 @@ pub struct Trace {
     pub result: Option<Value>,
     pub error: Option<String>,
     pub checksum: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<TraceMetadata>,
 }
 
 impl Trace {
@@ -1473,7 +1503,31 @@ impl Trace {
             result: self.result.clone(),
             error: self.error.clone(),
             checksum,
+            metadata: Some(self.slice_metadata(from, to)?),
         })
+    }
+
+    fn slice_metadata(&self, from: usize, to: usize) -> Result<TraceMetadata> {
+        let module_digest = digest_bytes(&self.module.to_bytes()?);
+        let mut metadata = self.metadata.clone().unwrap_or_else(|| TraceMetadata {
+            format_version: 1,
+            runtime_version: env!("CARGO_PKG_VERSION").into(),
+            module_digest: module_digest.clone(),
+            policy_digest: None,
+            limits: VmLimits::default(),
+            capabilities: BTreeMap::new(),
+            slice: None,
+        });
+        metadata.slice = Some(TraceSliceMetadata {
+            from,
+            to,
+            source_event_count: self.events.len(),
+            source_checksum: self.checksum,
+        });
+        metadata.module_digest = module_digest;
+        metadata.format_version = 1;
+        metadata.runtime_version = env!("CARGO_PKG_VERSION").into();
+        Ok(metadata)
     }
 }
 
@@ -1515,6 +1569,7 @@ pub enum CapabilityTraceDecision {
 pub struct ReplayReport {
     pub events_checked: usize,
     pub result: Option<Value>,
+    pub error: Option<String>,
     pub trace_checksum: u64,
 }
 
@@ -1721,6 +1776,17 @@ pub struct VmLimits {
     pub max_array_items: Option<usize>,
 }
 
+impl VmLimits {
+    pub fn sandbox_defaults() -> Self {
+        Self {
+            max_instructions: Some(100_000),
+            max_call_depth: Some(64),
+            max_registers: Some(1024),
+            max_array_items: Some(4096),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Vm {
     module: Module,
@@ -1796,6 +1862,7 @@ impl Vm {
                     result: Some(result),
                     error: None,
                     checksum,
+                    metadata: None,
                 })
             }
             Err(err) => {
@@ -1808,6 +1875,7 @@ impl Vm {
                     result: None,
                     error: Some(error),
                     checksum,
+                    metadata: None,
                 })
             }
         }
@@ -1815,6 +1883,23 @@ impl Vm {
 
     pub fn replay(trace: Trace) -> Result<ReplayReport> {
         Verifier::verify(&trace.module)?;
+        if trace
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.slice.as_ref())
+            .is_some()
+        {
+            return Err(ReplayError::new(
+                "trace slice is inspection-only; replay the full captured trace",
+            )
+            .into());
+        }
+        if trace.error.is_some() && trace.metadata.is_none() {
+            return Err(ReplayError::new(
+                "error trace cannot be replayed without recorded trace metadata and limits",
+            )
+            .into());
+        }
         let capability_results = trace
             .events
             .iter()
@@ -1831,12 +1916,15 @@ impl Vm {
             host: Arc::new(host),
             replay_capabilities: capability_results,
             replay_capability_index: 0,
-            limits: VmLimits::default(),
+            limits: trace
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.limits.clone())
+                .unwrap_or_default(),
             instruction_count: 0,
             call_depth: 0,
         };
         let (result, events) = vm.execute_collect(&trace.entry, false);
-        let result = result?;
         if events != trace.events {
             return Err(ReplayError::with_diff(
                 "trace events did not match replay",
@@ -1844,18 +1932,55 @@ impl Vm {
             )
             .into());
         }
-        if Some(result.clone()) != trace.result {
-            return Err(ReplayError::new("trace result did not match replay").into());
+        match (result, trace.result.as_ref(), trace.error.as_ref()) {
+            (Ok(result), Some(expected), None) => {
+                if &result != expected {
+                    return Err(ReplayError::new("trace result did not match replay").into());
+                }
+                let checksum = trace_checksum(&events, &Some(result.clone()), &None);
+                if checksum != trace.checksum {
+                    return Err(ReplayError::new("trace checksum did not match replay").into());
+                }
+                Ok(ReplayReport {
+                    events_checked: events.len(),
+                    result: Some(result),
+                    error: None,
+                    trace_checksum: checksum,
+                })
+            }
+            (Err(err), None, Some(expected)) => {
+                let error = err.to_string();
+                if &error != expected {
+                    return Err(ReplayError::new(format!(
+                        "trace error did not match replay: expected {expected}, got {error}"
+                    ))
+                    .into());
+                }
+                let checksum = trace_checksum(&events, &None, &Some(error.clone()));
+                if checksum != trace.checksum {
+                    return Err(ReplayError::new("trace checksum did not match replay").into());
+                }
+                Ok(ReplayReport {
+                    events_checked: events.len(),
+                    result: None,
+                    error: Some(error),
+                    trace_checksum: checksum,
+                })
+            }
+            (Ok(result), None, Some(expected)) => Err(ReplayError::new(format!(
+                "trace expected error {expected}, replay returned result {result:?}"
+            ))
+            .into()),
+            (Err(err), Some(_), None) => Err(err),
+            (Ok(_), None, None) => {
+                Err(ReplayError::new("trace has neither a result nor an error to validate").into())
+            }
+            (Err(err), None, None) => Err(err),
+            (_, Some(_), Some(_)) => Err(ReplayError::new(
+                "trace has both a result and an error; expected exactly one",
+            )
+            .into()),
         }
-        let checksum = trace_checksum(&events, &Some(result.clone()), &None);
-        if checksum != trace.checksum {
-            return Err(ReplayError::new("trace checksum did not match replay").into());
-        }
-        Ok(ReplayReport {
-            events_checked: events.len(),
-            result: Some(result),
-            trace_checksum: checksum,
-        })
     }
 
     fn execute_collect(
@@ -2207,6 +2332,15 @@ fn trace_checksum(events: &[TraceEvent], result: &Option<Value>, error: &Option<
     stable_checksum(&(events, result, error))
 }
 
+pub fn digest_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::from("sha256:");
+    for byte in digest {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
 fn stable_checksum<T: Serialize>(value: &T) -> u64 {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -2258,6 +2392,7 @@ fn state_before(events: &[TraceEvent], index: usize) -> Option<TraceState> {
         result: None,
         error: None,
         checksum: 0,
+        metadata: None,
     };
     TraceNavigator::new(slice)
         .state_at(index.min(events.len()) - 1)
@@ -2377,6 +2512,7 @@ fn display_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn policy_grant(name: &str) -> HostPolicy {
         HostPolicy {
@@ -2410,6 +2546,18 @@ mod tests {
                 code,
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
+        }
+    }
+
+    fn trace_metadata(module: &Module, limits: VmLimits) -> TraceMetadata {
+        TraceMetadata {
+            format_version: 1,
+            runtime_version: env!("CARGO_PKG_VERSION").into(),
+            module_digest: digest_bytes(&module.to_bytes().unwrap()),
+            policy_digest: Some(digest_bytes(b"test-policy")),
+            limits,
+            capabilities: BTreeMap::new(),
+            slice: None,
         }
     }
 
@@ -2632,6 +2780,7 @@ mod tests {
         let trace = vm.run_with_trace("main").unwrap();
         let report = Vm::replay(trace).unwrap();
         assert_eq!(report.events_checked, 2);
+        assert_eq!(report.error, None);
     }
 
     #[test]
@@ -2659,20 +2808,31 @@ mod tests {
             }],
             exports: BTreeMap::from([("main".into(), 0)]),
         };
-        let mut vm = Vm::new(module, HostPolicy::default())
+        let limits = VmLimits {
+            max_instructions: Some(1),
+            ..VmLimits::default()
+        };
+        let mut vm = Vm::new(module.clone(), HostPolicy::default())
             .unwrap()
-            .with_limits(VmLimits {
-                max_instructions: Some(1),
-                ..VmLimits::default()
-            });
-        let trace = vm.run_with_trace("main").unwrap();
+            .with_limits(limits.clone());
+        let mut trace = vm.run_with_trace("main").unwrap();
         assert_eq!(trace.events.len(), 2);
-        assert!(trace.error.unwrap().contains("instruction budget"));
+        assert!(trace.error.as_ref().unwrap().contains("instruction budget"));
         assert!(trace.events[1]
             .error
             .as_ref()
             .unwrap()
             .contains("instruction budget"));
+        assert!(matches!(
+            Vm::replay(trace.clone()),
+            Err(ChronicleError::Replay(error))
+                if error
+                    .message
+                    .contains("without recorded trace metadata and limits")
+        ));
+        trace.metadata = Some(trace_metadata(&module, limits));
+        let report = Vm::replay(trace).unwrap();
+        assert!(report.error.unwrap().contains("instruction budget"));
     }
 
     #[test]
@@ -2910,6 +3070,7 @@ mod tests {
             result: Some(Value::I64(2)),
             error: None,
             checksum: 99,
+            metadata: None,
         };
         let navigator = TraceNavigator::new(trace);
         assert_eq!(
@@ -2925,6 +3086,32 @@ mod tests {
         assert_eq!(navigator.capability_calls_between(0, 2).unwrap().len(), 1);
         assert_eq!(navigator.source_window(1, 1).unwrap().len(), 3);
         assert!(navigator.state_at(99).is_err());
+    }
+
+    #[test]
+    fn trace_slices_carry_metadata_and_are_inspection_only() {
+        let module = simple_module(vec![
+            Instruction::Const {
+                dst: 0,
+                constant: 0,
+            },
+            Instruction::Ret { src: 0 },
+        ]);
+        let mut vm = Vm::new(module.clone(), HostPolicy::default()).unwrap();
+        let mut trace = vm.run_with_trace("main").unwrap();
+        trace.metadata = Some(trace_metadata(&module, VmLimits::sandbox_defaults()));
+
+        let sliced = trace.slice(0, 0).unwrap();
+        let slice = sliced.metadata.as_ref().unwrap().slice.as_ref().unwrap();
+        assert_eq!(slice.from, 0);
+        assert_eq!(slice.to, 0);
+        assert_eq!(slice.source_event_count, 2);
+        assert_eq!(slice.source_checksum, trace.checksum);
+        assert!(matches!(
+            Vm::replay(sliced),
+            Err(ChronicleError::Replay(error))
+                if error.message.contains("inspection-only")
+        ));
     }
 
     #[test]
@@ -3014,6 +3201,55 @@ mod tests {
         for bytes in malformed_module_bytes() {
             let result = std::panic::catch_unwind(|| Module::from_bytes(&bytes));
             assert!(result.is_ok(), "Module::from_bytes panicked for {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn oversized_binary_lengths_are_rejected_before_allocation() {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut oversized_string = Vec::from(MODULE_MAGIC.as_slice());
+        push_u32(&mut oversized_string, (MAX_BINARY_STRING_BYTES + 1) as u32);
+        assert!(matches!(
+            Module::from_bytes(&oversized_string),
+            Err(ChronicleError::Decode(message))
+                if message.contains("binary string length")
+        ));
+
+        let mut oversized_list = Vec::from(MODULE_MAGIC.as_slice());
+        push_u32(&mut oversized_list, 4);
+        oversized_list.extend_from_slice(b"list");
+        push_u32(&mut oversized_list, (MAX_BINARY_LIST_ITEMS + 1) as u32);
+        assert!(matches!(
+            Module::from_bytes(&oversized_list),
+            Err(ChronicleError::Decode(message))
+                if message.contains("binary list length")
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn random_module_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..=4096)) {
+            let result = std::panic::catch_unwind(|| Module::from_bytes(&bytes));
+            prop_assert!(result.is_ok());
+        }
+
+        #[test]
+        fn mutated_valid_binary_windows_never_panic(offset in 0usize..512, replacement in any::<[u8; 4]>()) {
+            let mut bytes = simple_module(vec![
+                Instruction::Const { dst: 0, constant: 0 },
+                Instruction::Ret { src: 0 },
+            ]).to_bytes().unwrap();
+            let start = offset % bytes.len();
+            for (index, byte) in replacement.into_iter().enumerate() {
+                if start + index < bytes.len() {
+                    bytes[start + index] = byte;
+                }
+            }
+            let result = std::panic::catch_unwind(|| Module::from_bytes(&bytes));
+            prop_assert!(result.is_ok());
         }
     }
 

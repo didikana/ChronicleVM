@@ -16,7 +16,10 @@ capabilities.
 - Stable event checksum.
 
 The trace also stores the module, entry export, final result or error, and a
-final checksum over the replay-relevant event stream.
+final checksum over the replay-relevant event stream. New traces also include
+provenance metadata: runtime version, `sha256:` module digest, optional policy
+digest, effective resource limits, negotiated grant/mock capability decisions,
+and optional slice metadata.
 
 ## Replay Guarantees
 
@@ -24,6 +27,10 @@ final checksum over the replay-relevant event stream.
 - Replay consumes recorded capability return values in order.
 - Replay must produce the same instruction events, register changes, capability
   calls, result, and final checksum.
+- Failure traces that include recorded resource limits replay to the same error,
+  events, and checksum.
+- Error traces without metadata are rejected because the runtime cannot know the
+  limits needed to reproduce the failure deterministically.
 - On divergence, the first mismatching event is reported with expected and
   actual function, program counter, source line, opcode, and checksum.
 
@@ -51,7 +58,15 @@ bytecode. It can produce:
 Trace slices are smaller `.ctrace` files intended for inspection, debugging,
 and sharing a focused window of execution. Exact deterministic replay remains a
 guarantee for full captured traces, because sliced traces may omit prior state
-and earlier capability events required to re-execute from module entry.
+and earlier capability events required to re-execute from module entry. Slices
+carry explicit slice metadata and exact replay rejects them as inspection-only
+artifacts.
+
+## Audit
+
+`chronicle audit trace.ctrace` validates a full trace by replaying it, then
+reports module and policy digests, effective limits, checksum, result or error,
+and capability call counts. `--json` emits the same report for automation.
 
 ## Web Viewer
 

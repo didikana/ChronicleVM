@@ -29,9 +29,13 @@ or type-invalid capabilities stop the run before plugin code can call them.
 - **Capability negotiation:** compares the module manifest with the host policy
   and, for embedded hosts, the registered host signatures.
 - **Resource limits:** bound deterministic execution with max instruction count,
-  call depth, register count, and array size.
+  call depth, register count, and array size. CLI `run` and `trace` use safe
+  defaults unless `--unbounded` is passed explicitly.
 - **Trace/replay contract:** records capability invocations and returned values;
   replay consumes the trace and never calls live host capabilities.
+- **Trace provenance:** records runtime version, module and policy digests,
+  effective limits, and negotiated capability decisions so audit output can be
+  tied back to the executable module and host policy.
 
 ## Non-Goals
 
@@ -45,7 +49,9 @@ ChronicleVM inside the isolation boundary appropriate for their deployment.
 Invalid input should fail by returning a structured decode, verify, policy,
 runtime, resource-limit, or replay error. Malformed modules should not panic.
 Programs that exceed resource limits may produce traces containing the failed
-event, so the failure can still be inspected and replayed as evidence.
+event, so the failure can still be inspected and replayed as evidence when the
+trace includes recorded limits. Trace slices are inspection-only and rejected by
+exact replay.
 
 ## Local Hardening Checks
 
@@ -57,4 +63,5 @@ cargo bench -p chronicle-cli --no-run
 
 The test suite includes deterministic malformed-module smoke tests that feed
 truncated, mutated, old-version, bad-tag, and random-looking binary data into
-`Module::from_bytes` and assert that decoding does not panic.
+`Module::from_bytes` and assert that decoding does not panic. It also includes
+`proptest` coverage for random byte inputs and mutated valid binaries.

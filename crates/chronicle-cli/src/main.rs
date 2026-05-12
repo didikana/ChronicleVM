@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use chronicle_asm::Assembler;
 use chronicle_core::{
-    CapabilityDecision, ChronicleError, HostPolicy, Module, ReplayError, StateDiff, Trace,
-    TraceNavigator, TraceState, Value, Verifier, Vm, VmLimits,
+    digest_bytes, CapabilityDecision, CapabilityTraceDecision, ChronicleError, HostPolicy, Module,
+    ReplayError, StateDiff, Trace, TraceCapabilityDecision, TraceMetadata, TraceNavigator,
+    TraceSliceMetadata, TraceState, Value, Verifier, Vm, VmLimits,
 };
 use chronicle_lang::Compiler;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
@@ -62,6 +63,11 @@ enum Command {
         #[command(flatten)]
         limits: LimitArgs,
     },
+    Audit {
+        trace: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     Replay {
         trace: PathBuf,
         #[arg(long)]
@@ -95,6 +101,8 @@ enum CompileEmit {
 #[derive(Clone, Debug, Default, Args)]
 struct LimitArgs {
     #[arg(long)]
+    unbounded: bool,
+    #[arg(long)]
     max_instructions: Option<usize>,
     #[arg(long)]
     max_call_depth: Option<usize>,
@@ -104,14 +112,36 @@ struct LimitArgs {
     max_array_items: Option<usize>,
 }
 
-impl From<LimitArgs> for VmLimits {
-    fn from(args: LimitArgs) -> Self {
-        Self {
-            max_instructions: args.max_instructions,
-            max_call_depth: args.max_call_depth,
-            max_registers: args.max_registers,
-            max_array_items: args.max_array_items,
+impl LimitArgs {
+    fn effective_limits(&self) -> Result<VmLimits> {
+        if self.unbounded && self.has_explicit_limits() {
+            anyhow::bail!("--unbounded cannot be combined with explicit --max-* limits");
         }
+        let mut limits = if self.unbounded {
+            VmLimits::default()
+        } else {
+            VmLimits::sandbox_defaults()
+        };
+        if let Some(value) = self.max_instructions {
+            limits.max_instructions = Some(value);
+        }
+        if let Some(value) = self.max_call_depth {
+            limits.max_call_depth = Some(value);
+        }
+        if let Some(value) = self.max_registers {
+            limits.max_registers = Some(value);
+        }
+        if let Some(value) = self.max_array_items {
+            limits.max_array_items = Some(value);
+        }
+        Ok(limits)
+    }
+
+    fn has_explicit_limits(&self) -> bool {
+        self.max_instructions.is_some()
+            || self.max_call_depth.is_some()
+            || self.max_registers.is_some()
+            || self.max_array_items.is_some()
     }
 }
 
@@ -171,7 +201,7 @@ fn main() -> Result<()> {
         } => {
             let module = load_module(&module)?;
             let policy = load_policy(&policy)?;
-            let mut vm = Vm::new(module, policy)?.with_limits(limits.into());
+            let mut vm = Vm::new(module, policy)?.with_limits(limits.effective_limits()?);
             let result = vm.run_entry(&entry)?;
             println!("{}", render_value(&result));
         }
@@ -183,28 +213,64 @@ fn main() -> Result<()> {
             limits,
         } => {
             let module = load_module(&module)?;
-            let policy = load_policy(&policy)?;
-            let mut vm = Vm::new(module, policy)?.with_limits(limits.into());
-            let trace = vm.run_with_trace(&entry)?;
+            let policy = load_policy_with_digest(&policy)?;
+            let effective_limits = limits.effective_limits()?;
+            let mut vm = Vm::new(module.clone(), policy.policy.clone())?
+                .with_limits(effective_limits.clone());
+            let mut trace = vm.run_with_trace(&entry)?;
+            trace.metadata = Some(build_trace_metadata(
+                &module,
+                &policy.policy,
+                Some(policy.digest),
+                effective_limits,
+                None,
+            )?);
             fs::write(&out, serde_json::to_vec_pretty(&trace)?)?;
             if let Some(error) = trace.error {
                 return Err(anyhow!("trace captured error: {error}"));
             }
             println!("wrote {}", out.display());
         }
+        Command::Audit { trace, json } => {
+            let trace = load_trace(&trace)?;
+            let report = audit_trace(trace);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_audit_report(&report);
+            }
+            if !report.valid {
+                anyhow::bail!(
+                    "trace audit failed: {}",
+                    report
+                        .replay_error
+                        .as_deref()
+                        .unwrap_or("replay validation failed")
+                );
+            }
+        }
         Command::Replay { trace, verbose } => {
             let trace = load_trace(&trace)?;
             match Vm::replay(trace) {
-                Ok(report) => println!(
-                    "replayed {} events, checksum {}, result {}",
-                    report.events_checked,
-                    report.trace_checksum,
-                    report
-                        .result
-                        .as_ref()
-                        .map(render_value)
-                        .unwrap_or_else(|| "nil".into())
-                ),
+                Ok(report) => {
+                    if let Some(error) = &report.error {
+                        println!(
+                            "replayed {} events, checksum {}, error {}",
+                            report.events_checked, report.trace_checksum, error
+                        );
+                    } else {
+                        println!(
+                            "replayed {} events, checksum {}, result {}",
+                            report.events_checked,
+                            report.trace_checksum,
+                            report
+                                .result
+                                .as_ref()
+                                .map(render_value)
+                                .unwrap_or_else(|| "nil".into())
+                        );
+                    }
+                }
                 Err(ChronicleError::Replay(error)) => {
                     print_replay_error(&error, verbose);
                     return Err(error.into());
@@ -314,7 +380,17 @@ struct RawPolicyEntry {
     mock: Option<toml::Value>,
 }
 
+#[derive(Clone, Debug)]
+struct LoadedPolicy {
+    policy: HostPolicy,
+    digest: String,
+}
+
 fn load_policy(path: &PathBuf) -> Result<HostPolicy> {
+    Ok(load_policy_with_digest(path)?.policy)
+}
+
+fn load_policy_with_digest(path: &PathBuf) -> Result<LoadedPolicy> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read policy {}", path.display()))?;
     let raw: RawPolicy = toml::from_str(&source).context("failed to parse policy TOML")?;
@@ -322,7 +398,10 @@ fn load_policy(path: &PathBuf) -> Result<HostPolicy> {
     for (capability, entry) in raw.capabilities {
         decisions.insert(capability, convert_decision(entry)?);
     }
-    Ok(HostPolicy { decisions })
+    Ok(LoadedPolicy {
+        policy: HostPolicy { decisions },
+        digest: digest_bytes(source.as_bytes()),
+    })
 }
 
 fn convert_decision(entry: RawPolicyEntry) -> Result<CapabilityDecision> {
@@ -351,6 +430,189 @@ fn toml_value_to_vm_value(value: toml::Value) -> Result<Value> {
             .map(Value::Array),
         other => Err(anyhow!("unsupported mock value {other:?}")),
     }
+}
+
+fn build_trace_metadata(
+    module: &Module,
+    policy: &HostPolicy,
+    policy_digest: Option<String>,
+    limits: VmLimits,
+    slice: Option<TraceSliceMetadata>,
+) -> Result<TraceMetadata> {
+    let capabilities = policy
+        .negotiate(module)
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            let decision = match entry.status {
+                chronicle_core::NegotiationStatus::Granted => TraceCapabilityDecision::Grant,
+                chronicle_core::NegotiationStatus::Mocked => TraceCapabilityDecision::Mock,
+                _ => return None,
+            };
+            Some((entry.capability, decision))
+        })
+        .collect();
+    Ok(TraceMetadata {
+        format_version: 1,
+        runtime_version: env!("CARGO_PKG_VERSION").into(),
+        module_digest: digest_bytes(&module.to_bytes()?),
+        policy_digest,
+        limits,
+        capabilities,
+        slice,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct AuditReport {
+    valid: bool,
+    replay_error: Option<String>,
+    module: String,
+    entry: String,
+    events: usize,
+    checksum: u64,
+    runtime_version: Option<String>,
+    module_digest: Option<String>,
+    policy_digest: Option<String>,
+    limits: Option<VmLimits>,
+    result: Option<Value>,
+    error: Option<String>,
+    slice: Option<TraceSliceMetadata>,
+    capabilities: BTreeMap<String, AuditCapabilityCounts>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct AuditCapabilityCounts {
+    calls: usize,
+    granted: usize,
+    mocked: usize,
+    replayed: usize,
+    negotiated: Option<TraceCapabilityDecision>,
+}
+
+fn audit_trace(trace: Trace) -> AuditReport {
+    let replay = Vm::replay(trace.clone());
+    let (valid, replay_error) = match replay {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(error.to_string())),
+    };
+    let mut capabilities: BTreeMap<String, AuditCapabilityCounts> = BTreeMap::new();
+    if let Some(metadata) = &trace.metadata {
+        for (capability, decision) in &metadata.capabilities {
+            capabilities
+                .entry(capability.clone())
+                .or_default()
+                .negotiated = Some(decision.clone());
+        }
+    }
+    for event in &trace.events {
+        let Some(capability) = &event.capability else {
+            continue;
+        };
+        let counts = capabilities.entry(capability.id.clone()).or_default();
+        counts.calls += 1;
+        match capability.decision {
+            CapabilityTraceDecision::Granted => counts.granted += 1,
+            CapabilityTraceDecision::Mocked => counts.mocked += 1,
+            CapabilityTraceDecision::Replayed => counts.replayed += 1,
+        }
+    }
+    AuditReport {
+        valid,
+        replay_error,
+        module: trace.module.name.clone(),
+        entry: trace.entry.clone(),
+        events: trace.events.len(),
+        checksum: trace.checksum,
+        runtime_version: trace
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.runtime_version.clone()),
+        module_digest: trace
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.module_digest.clone()),
+        policy_digest: trace
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.policy_digest.clone()),
+        limits: trace
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.limits.clone()),
+        result: trace.result.clone(),
+        error: trace.error.clone(),
+        slice: trace
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.slice.clone()),
+        capabilities,
+    }
+}
+
+fn print_audit_report(report: &AuditReport) {
+    println!("audit: {}", if report.valid { "valid" } else { "invalid" });
+    if let Some(error) = &report.replay_error {
+        println!("replay error: {error}");
+    }
+    println!("module: {}", report.module);
+    println!("entry: {}", report.entry);
+    println!("events: {}", report.events);
+    println!("checksum: {}", report.checksum);
+    if let Some(version) = &report.runtime_version {
+        println!("runtime: {version}");
+    }
+    if let Some(digest) = &report.module_digest {
+        println!("module digest: {digest}");
+    }
+    if let Some(digest) = &report.policy_digest {
+        println!("policy digest: {digest}");
+    }
+    if let Some(limits) = &report.limits {
+        println!("limits: {}", render_limits(limits));
+    }
+    if let Some(slice) = &report.slice {
+        println!(
+            "slice: {}..={} of {} events from checksum {}",
+            slice.from, slice.to, slice.source_event_count, slice.source_checksum
+        );
+    }
+    if let Some(result) = &report.result {
+        println!("result: {}", render_value(result));
+    }
+    if let Some(error) = &report.error {
+        println!("error: {error}");
+    }
+    if !report.capabilities.is_empty() {
+        println!("capabilities:");
+        for (id, counts) in &report.capabilities {
+            let negotiated = counts
+                .negotiated
+                .as_ref()
+                .map(|decision| format!(" negotiated={decision:?}"))
+                .unwrap_or_default();
+            println!(
+                "  {id}: calls={} granted={} mocked={} replayed={}{}",
+                counts.calls, counts.granted, counts.mocked, counts.replayed, negotiated
+            );
+        }
+    }
+}
+
+fn render_limits(limits: &VmLimits) -> String {
+    format!(
+        "max_instructions={} max_call_depth={} max_registers={} max_array_items={}",
+        render_optional_usize(limits.max_instructions),
+        render_optional_usize(limits.max_call_depth),
+        render_optional_usize(limits.max_registers),
+        render_optional_usize(limits.max_array_items)
+    )
+}
+
+fn render_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unbounded".into())
 }
 
 fn print_capability_audit(trace: &Trace) {
@@ -852,5 +1114,45 @@ fn render_value(value: &Value) -> String {
         Value::String(value) => value.clone(),
         Value::Array(values) => format!("{values:?}"),
         Value::Function(value) | Value::Capability(value) => value.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limit_args_use_sandbox_defaults() {
+        assert_eq!(
+            LimitArgs::default().effective_limits().unwrap(),
+            VmLimits::sandbox_defaults()
+        );
+    }
+
+    #[test]
+    fn limit_args_override_individual_defaults() {
+        let limits = LimitArgs {
+            max_instructions: Some(7),
+            ..LimitArgs::default()
+        }
+        .effective_limits()
+        .unwrap();
+        assert_eq!(limits.max_instructions, Some(7));
+        assert_eq!(
+            limits.max_call_depth,
+            VmLimits::sandbox_defaults().max_call_depth
+        );
+    }
+
+    #[test]
+    fn unbounded_rejects_explicit_limits() {
+        let err = LimitArgs {
+            unbounded: true,
+            max_instructions: Some(7),
+            ..LimitArgs::default()
+        }
+        .effective_limits()
+        .unwrap_err();
+        assert!(err.to_string().contains("--unbounded cannot be combined"));
     }
 }

@@ -28,6 +28,7 @@ Formal specs:
 cargo run -p chronicle-cli -- run examples/hello.casm --policy examples/policy.toml
 cargo run -p chronicle-cli -- trace examples/clock.casm --policy examples/policy.toml --out /tmp/run.ctrace
 cargo run -p chronicle-cli -- inspect /tmp/run.ctrace
+cargo run -p chronicle-cli -- audit /tmp/run.ctrace
 cargo run -p chronicle-cli -- replay /tmp/run.ctrace
 cargo run -p chronicle-cli -- debug /tmp/run.ctrace
 cargo run -p chronicle-cli -- verify examples/plugin.casm
@@ -50,6 +51,7 @@ cargo run -p chronicle-cli -- compile examples/audit-plugin.chr --out /tmp/audit
 cargo run -p chronicle-cli -- negotiate /tmp/audit.cmod --policy examples/audit-policy.toml
 cargo run -p chronicle-cli -- trace /tmp/audit.cmod --policy examples/audit-policy.toml --out /tmp/audit.ctrace --max-instructions 10000
 cargo run -p chronicle-cli -- inspect /tmp/audit.ctrace
+cargo run -p chronicle-cli -- audit /tmp/audit.ctrace --json
 cargo run -p chronicle-cli -- replay /tmp/audit.ctrace
 cargo run -p chronicle-cli -- debug /tmp/audit.ctrace --commands "source;next;regs;caps;jump 20;event;quit"
 cargo run -p chronicle-cli -- debug /tmp/audit.ctrace --commands "jump 20;state;back 5;diff 15 20;why;quit"
@@ -221,7 +223,14 @@ After installation, the CLI is available as `chronicle`.
 
 ## Resource Limits
 
-`run` and `trace` accept deterministic sandbox limits:
+`run` and `trace` use deterministic sandbox limits by default:
+
+- `--max-instructions 100000`
+- `--max-call-depth 64`
+- `--max-registers 1024`
+- `--max-array-items 4096`
+
+Each limit can be overridden individually:
 
 ```sh
 chronicle run examples/audit-plugin.chr --policy examples/audit-policy.toml \
@@ -232,7 +241,23 @@ chronicle run examples/audit-plugin.chr --policy examples/audit-policy.toml \
 ```
 
 If a limit is hit during tracing, the trace records the failed event and the
-resource-limit error.
+resource-limit error. Use `--unbounded` only when intentionally reproducing the
+older unlimited CLI behavior; it cannot be combined with explicit `--max-*`
+flags.
+
+## Trace Audit
+
+Traces include provenance metadata: runtime version, module digest, policy
+digest, effective limits, and negotiated grant/mock capability decisions.
+
+```sh
+chronicle audit /tmp/audit.ctrace
+chronicle audit /tmp/audit.ctrace --json
+```
+
+`audit` replays full traces to validate the checksum and reports capability
+counts, limits, digests, result, or recorded error. Trace slices are marked as
+inspection-only and are rejected by exact replay.
 
 ## Trace Debugger
 
