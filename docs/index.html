@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="ChronicleVM is a Rust replayable sandbox VM for safe plugins with typed capabilities, trace audit, and deterministic replay."
+    />
+    <title>ChronicleVM | Replayable Rust Sandbox VM</title>
+    <link rel="stylesheet" href="./site.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="ChronicleVM home">
+        <span class="brand-mark">C</span>
+        <span>ChronicleVM</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#demo">Demo</a>
+        <a href="#security">Security</a>
+        <a href="#architecture">Architecture</a>
+        <a href="./trace-viewer/">Trace Viewer</a>
+      </nav>
+      <a class="header-action" href="https://github.com/didikana/ChronicleVM">GitHub</a>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Rust systems/security project</p>
+          <h1>Replayable sandboxing for safe plugins.</h1>
+          <p class="lede">
+            ChronicleVM is a Rust VM that runs plugins through typed capability
+            negotiation, records provenance-rich traces, and replays executions
+            deterministically for audit and debugging.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="https://github.com/didikana/ChronicleVM">View on GitHub</a>
+            <a class="button secondary" href="./trace-viewer/">Open Trace Viewer</a>
+          </div>
+          <dl class="proof-strip" aria-label="Project highlights">
+            <div>
+              <dt>Runtime</dt>
+              <dd>Rust VM</dd>
+            </div>
+            <div>
+              <dt>Model</dt>
+              <dd>Typed capabilities</dd>
+            </div>
+            <div>
+              <dt>Evidence</dt>
+              <dd>Trace replay</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div class="hero-panel" aria-label="Trace audit preview">
+          <div class="terminal">
+            <div class="terminal-bar">
+              <span></span>
+              <span></span>
+              <span></span>
+              <strong>chronicle audit</strong>
+            </div>
+            <pre><code>$ chronicle audit /tmp/audit.ctrace
+audit: valid
+module: audit_plugin
+events: 39
+module digest: sha256:8d4f...
+policy digest: sha256:42b1...
+limits: max_instructions=100000
+capabilities:
+  clock.now@1: 1 mocked
+  random.u64@1: 1 mocked
+  log.print@1: 5 granted</code></pre>
+          </div>
+
+          <div class="trace-card">
+            <div class="trace-header">
+              <span>Trace timeline</span>
+              <strong>checksum verified</strong>
+            </div>
+            <ol>
+              <li><span>#0</span><strong>cap_call clock.now@1</strong><em>mocked</em></li>
+              <li><span>#1</span><strong>cap_call random.u64@1</strong><em>mocked</em></li>
+              <li><span>#6</span><strong>cap_call log.print@1</strong><em>granted</em></li>
+              <li><span>#20</span><strong>jump_if risk &lt;= threshold</strong><em>replayable</em></li>
+            </ol>
+          </div>
+        </div>
+      </section>
+
+      <section id="demo" class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Five-minute demo</p>
+          <h2>Run, audit, replay, and inspect a plugin trace.</h2>
+        </div>
+        <div class="demo-grid">
+          <div class="code-block">
+            <pre><code>cargo run -p chronicle-cli -- trace examples/audit-plugin.chr \
+  --policy examples/audit-policy.toml \
+  --out /tmp/audit.ctrace
+
+cargo run -p chronicle-cli -- audit /tmp/audit.ctrace
+cargo run -p chronicle-cli -- replay /tmp/audit.ctrace
+cargo run -p chronicle-cli -- debug /tmp/audit.ctrace \
+  --commands "source;next;regs;caps;jump 20;why;quit"</code></pre>
+          </div>
+          <div class="demo-notes">
+            <article>
+              <h3>Typed host powers</h3>
+              <p>Plugins declare versioned capabilities. Hosts grant, deny, or mock them before execution.</p>
+            </article>
+            <article>
+              <h3>Deterministic evidence</h3>
+              <p>Trace events capture source lines, register changes, capability calls, results, errors, and checksums.</p>
+            </article>
+            <article>
+              <h3>Browser inspection</h3>
+              <p>The static trace viewer loads `.ctrace` files locally and exposes timelines, diffs, source maps, and raw events.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="security" class="section feature-band">
+        <div class="section-heading">
+          <p class="eyebrow">Security posture</p>
+          <h2>Designed around explicit boundaries.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <span>01</span>
+            <h3>Capability negotiation</h3>
+            <p>Host access is mediated by versioned signatures and policy decisions. Missing or denied capabilities fail before plugin code runs.</p>
+          </article>
+          <article>
+            <span>02</span>
+            <h3>Default sandbox limits</h3>
+            <p>CLI runs are bounded by instruction count, call depth, register count, and array size unless `--unbounded` is explicit.</p>
+          </article>
+          <article>
+            <span>03</span>
+            <h3>Malformed input hardening</h3>
+            <p>The binary decoder rejects oversized lengths, bad tags, truncation, and random mutated inputs with structured errors.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="architecture" class="section architecture">
+        <div class="section-heading">
+          <p class="eyebrow">Architecture</p>
+          <h2>A compact workspace with a complete runtime story.</h2>
+        </div>
+        <div class="architecture-grid">
+          <article>
+            <h3>Core VM</h3>
+            <p>`chronicle-core` owns bytecode, verification, VM execution, trace replay, host SDK, and audit metadata.</p>
+          </article>
+          <article>
+            <h3>Language and assembly</h3>
+            <p>`chronicle-lang` compiles `.chr` source; `chronicle-asm` parses `.casm` modules for lower-level experiments.</p>
+          </article>
+          <article>
+            <h3>CLI and viewer</h3>
+            <p>`chronicle-cli` runs the workflow end to end. GitHub Pages hosts the trace viewer and project landing page.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>ChronicleVM</span>
+      <a href="./security.html">Security model</a>
+      <a href="./trace-replay.html">Trace replay</a>
+      <a href="https://github.com/didikana/ChronicleVM">GitHub</a>
+    </footer>
+  </body>
+</html>

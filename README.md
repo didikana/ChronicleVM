@@ -1,72 +1,157 @@
-# Chronicle VM
+# ChronicleVM
 
-Chronicle VM is a small Rust VM for safe plugins. Its v1 identity is a
-replayable sandbox: modules declare capabilities, a host policy negotiates what
-they receive, and execution can be traced and replayed deterministically.
-Traces preserve source line metadata from `.casm` modules, so inspection can
-connect VM events back to source instructions.
+ChronicleVM is a Rust safe-plugin runtime built around one idea: plugin
+execution should be bounded, inspectable, and replayable.
 
-Formal specs:
+It includes a bytecode VM, high-level `.chr` language, typed capability
+negotiation, deterministic trace/replay, time-travel debugging, a browser trace
+viewer, an embeddable Rust host SDK, and security hardening for malformed input
+and runaway plugins.
 
-- [Verifier](docs/verifier.md)
-- [Trace and replay](docs/trace-replay.md)
-- [Capabilities](docs/capabilities.md)
-- [Security model](docs/security.md)
-- [Benchmarks](docs/benchmarks.md)
+[![CI](https://github.com/didikana/ChronicleVM/actions/workflows/ci.yml/badge.svg)](https://github.com/didikana/ChronicleVM/actions/workflows/ci.yml)
 
-## Workspace
+## Why It Exists
 
-- `chronicle-core`: bytecode model, verifier, runtime, host SDK, capabilities, trace replay.
-- `chronicle-asm`: text assembly parser for `.casm` modules.
-- `chronicle-lang`: high-level `.chr` language compiler.
-- `chronicle-cli`: `chronicle` command line runner.
-- `chronicle-embed-demo`: small Rust app embedding ChronicleVM with custom host capabilities.
+Most plugin systems answer "did it run?" ChronicleVM answers more useful
+questions:
 
-## Try It
+- What host powers did the plugin request?
+- Which powers were granted, mocked, or denied?
+- What exactly happened at each instruction?
+- Can the run be replayed without calling live host capabilities?
+- Can a failure trace be preserved as evidence?
+
+That makes ChronicleVM a systems/security project, not just a toy VM.
+
+## Highlights
+
+- **Typed capabilities:** plugins declare versioned host powers such as
+  `clock.now@1`, `random.u64@1`, or app-owned capabilities like `kv.get@1`.
+- **Policy negotiation:** hosts grant, deny, or mock capabilities before any
+  plugin bytecode runs.
+- **Deterministic trace/replay:** traces record instruction events, register
+  changes, source lines, capability calls, results, errors, and checksums.
+- **Trace audit:** `chronicle audit` validates full traces by replaying them and
+  reports module/policy digests, limits, capability counts, result, or error.
+- **Time-travel debugging:** step forward/backward, jump to events, inspect
+  reconstructed state, diff event ranges, and slice traces.
+- **Security hardening:** CLI sandbox limits are enabled by default, malformed
+  binary modules return structured errors, and property tests exercise random
+  and mutated binary inputs.
+- **Embeddable host SDK:** Rust apps can register custom capability handlers and
+  run plugins with `Vm::new_with_host`.
+- **Static trace viewer:** a GitHub Pages-ready viewer loads `.ctrace` files
+  locally in the browser.
+
+## Demo
+
+Run the flagship audit plugin:
 
 ```sh
-cargo run -p chronicle-cli -- run examples/hello.casm --policy examples/policy.toml
-cargo run -p chronicle-cli -- trace examples/clock.casm --policy examples/policy.toml --out /tmp/run.ctrace
-cargo run -p chronicle-cli -- inspect /tmp/run.ctrace
-cargo run -p chronicle-cli -- audit /tmp/run.ctrace
-cargo run -p chronicle-cli -- replay /tmp/run.ctrace
-cargo run -p chronicle-cli -- debug /tmp/run.ctrace
-cargo run -p chronicle-cli -- verify examples/plugin.casm
-cargo run -p chronicle-cli -- negotiate examples/plugin.chr --policy examples/plugin-mock.toml
-cargo run -p chronicle-cli -- assemble examples/plugin.casm --out /tmp/plugin.cmod
-cargo run -p chronicle-cli -- compile examples/plugin.chr --emit casm --out /tmp/plugin.casm
-cargo run -p chronicle-cli -- compile examples/plugin.chr --out /tmp/plugin.cmod
-cargo run -p chronicle-cli -- run examples/plugin.casm --policy examples/plugin-mock.toml
-cargo run -p chronicle-cli -- run examples/plugin.chr --policy examples/plugin-mock.toml
-```
+cargo run -p chronicle-cli -- trace examples/audit-plugin.chr \
+  --policy examples/audit-policy.toml \
+  --out /tmp/audit.ctrace
 
-## 5-Minute Demo
-
-The flagship demo is a deterministic audit plugin. It uses the high-level
-language, typed capability negotiation, mocked time/randomness, tracing, replay,
-CLI debugging, and the browser trace viewer.
-
-```sh
-cargo run -p chronicle-cli -- compile examples/audit-plugin.chr --out /tmp/audit.cmod
-cargo run -p chronicle-cli -- negotiate /tmp/audit.cmod --policy examples/audit-policy.toml
-cargo run -p chronicle-cli -- trace /tmp/audit.cmod --policy examples/audit-policy.toml --out /tmp/audit.ctrace --max-instructions 10000
-cargo run -p chronicle-cli -- inspect /tmp/audit.ctrace
-cargo run -p chronicle-cli -- audit /tmp/audit.ctrace --json
+cargo run -p chronicle-cli -- audit /tmp/audit.ctrace
 cargo run -p chronicle-cli -- replay /tmp/audit.ctrace
-cargo run -p chronicle-cli -- debug /tmp/audit.ctrace --commands "source;next;regs;caps;jump 20;event;quit"
-cargo run -p chronicle-cli -- debug /tmp/audit.ctrace --commands "jump 20;state;back 5;diff 15 20;why;quit"
-cargo run -p chronicle-cli -- trace-slice /tmp/audit.ctrace --from 15 --to 35 --out /tmp/audit-risk-window.ctrace
-cargo run -p chronicle-cli -- inspect /tmp/audit-risk-window.ctrace
-python3 -m http.server 4173 --directory tools/trace-viewer
+cargo run -p chronicle-cli -- debug /tmp/audit.ctrace \
+  --commands "source;next;regs;caps;jump 20;why;quit"
 ```
 
-Then visit `http://localhost:4173` and open `/tmp/audit.ctrace`.
+Open the trace viewer:
+
+```sh
+python3 -m http.server 4173 --directory docs
+```
+
+Then visit `http://localhost:4173/trace-viewer/` and open
+`/tmp/audit.ctrace`.
+
+## What The Demo Shows
+
+The audit plugin uses mocked time/randomness, prints audit events, computes a
+risk score, and returns a deterministic decision. The trace captures:
+
+- source-correlated instruction events,
+- capability calls and returned values,
+- register changes,
+- final result or resource-limit error,
+- replay checksum,
+- provenance metadata with `sha256:` module and policy digests.
+
+Replay validates the trace without invoking live host capabilities.
+
+## CLI
+
+```sh
+cargo run -p chronicle-cli -- verify examples/plugin.chr
+cargo run -p chronicle-cli -- negotiate examples/plugin.chr --policy examples/plugin-mock.toml
+cargo run -p chronicle-cli -- compile examples/plugin.chr --out /tmp/plugin.cmod
+cargo run -p chronicle-cli -- run examples/plugin.chr --policy examples/plugin-mock.toml
+cargo run -p chronicle-cli -- trace examples/plugin.chr --policy examples/plugin-mock.toml --out /tmp/plugin.ctrace
+cargo run -p chronicle-cli -- inspect /tmp/plugin.ctrace
+cargo run -p chronicle-cli -- audit /tmp/plugin.ctrace --json
+cargo run -p chronicle-cli -- replay /tmp/plugin.ctrace
+cargo run -p chronicle-cli -- trace-slice /tmp/plugin.ctrace --from 1 --to 3 --out /tmp/slice.ctrace
+```
+
+Install locally:
+
+```sh
+cargo install --path crates/chronicle-cli
+```
+
+## Safe Defaults
+
+`run` and `trace` use deterministic sandbox limits by default:
+
+- `--max-instructions 100000`
+- `--max-call-depth 64`
+- `--max-registers 1024`
+- `--max-array-items 4096`
+
+Override limits individually:
+
+```sh
+chronicle run examples/audit-plugin.chr --policy examples/audit-policy.toml \
+  --max-instructions 10000 \
+  --max-call-depth 32
+```
+
+Use `--unbounded` only when intentionally reproducing older unlimited CLI
+behavior. It cannot be combined with explicit `--max-*` flags.
+
+## Security Demo
+
+`examples/malicious-plugin.chr` intentionally loops forever. ChronicleVM stops
+it with the default instruction budget:
+
+```sh
+cargo run -p chronicle-cli -- run examples/malicious-plugin.chr \
+  --policy examples/policy.toml
+```
+
+Expected result:
+
+```text
+resource limit exceeded: instruction budget exceeded max 100000
+```
+
+You can also capture a bounded failure trace and audit it:
+
+```sh
+cargo run -p chronicle-cli -- trace examples/audit-plugin.chr \
+  --policy examples/audit-policy.toml \
+  --max-instructions 1 \
+  --out /tmp/limited.ctrace
+
+cargo run -p chronicle-cli -- audit /tmp/limited.ctrace
+```
 
 ## Embedding ChronicleVM
 
-ChronicleVM can be embedded as a Rust safe-plugin runtime. Apps create a
-`HostRegistry`, keep the built-ins they want, register app-owned capabilities
-with typed signatures, negotiate a plugin policy, and then run or trace the VM.
+Rust hosts register app-owned capabilities with typed signatures and construct
+the VM with `Vm::new_with_host`.
 
 ```rust
 use chronicle_core::{
@@ -95,198 +180,59 @@ let mut vm = Vm::new_with_host(module, policy, host)?;
 let trace = vm.run_with_trace("main")?;
 ```
 
-Run the full embedding demo:
+Run the embedding demo:
 
 ```sh
 cargo run -p chronicle-embed-demo
-cargo run -p chronicle-cli -- inspect /tmp/embedded-plugin.ctrace
+cargo run -p chronicle-cli -- audit /tmp/embedded-plugin.ctrace
 cargo run -p chronicle-cli -- replay /tmp/embedded-plugin.ctrace
 ```
 
-The demo plugin is `examples/embedded-plugin.chr`. It uses custom app
-capabilities (`kv.get@1`, `kv.set@1`, `audit.emit@1`) plus the built-ins. Live
-custom capabilities are called only while recording the trace; replay uses the
-recorded capability results and does not invoke the host.
-
-## Security Demo
-
-`examples/malicious-plugin.chr` intentionally loops forever. ChronicleVM stops
-it with a deterministic instruction budget instead of letting the plugin run
-unbounded:
-
-```sh
-cargo run -p chronicle-cli -- run examples/malicious-plugin.chr \
-  --policy examples/policy.toml \
-  --max-instructions 25
-```
-
-The expected result is a resource-limit error containing `instruction budget`.
-For malformed binary modules, the core decoder returns structured errors rather
-than panicking; those cases are covered by `cargo test`.
-
-## Assembly Sketch
-
-```asm
-.module "hello"
-.cap log.print@1(any...) -> nil reason="debug output"
-
-.fn main r3
-  const r0, "Hello from Chronicle"
-  cap_call r1, log.print@1, r0
-  ret r1
-.end
-```
-
-Function headers use `.fn name rN`, where `N` is the register count and valid
-registers are `r0` through `rN-1`. For callable functions, add `arity=N`.
-
-## Policy Sketch
-
-```toml
-[capabilities."log.print@1"]
-decision = "grant"
-
-[capabilities."clock.now@1"]
-decision = "grant"
-
-[capabilities."random.u64@1"]
-decision = "mock"
-mock = 42
-```
-
-Any undeclared or unlisted capability is denied by default.
-
-## Binary Modules
-
-`chronicle assemble` writes Chronicle binary modules with a `CHVMOD2` header.
-The CLI can run or verify `.casm` source modules, binary modules such as
-`.cmod`, high-level `.chr` source modules, and legacy JSON module files.
-
-## Chronicle Language Sketch
-
-`.chr` files are a compact high-level source format that compiles to `.casm` or
-binary bytecode:
+## Language Sketch
 
 ```text
 module safe_plugin
 cap log.print@1(any...) -> nil "emit audit line"
+cap clock.now@1() -> i64 "timestamp plugin execution"
 
 fn main
-  let started = "plugin started"
-  cap log.print@1(started)
-  let result = [1, 2]
-  return result
+  let timestamp = cap clock.now@1()
+  print("plugin started", timestamp)
+  return ["ok", timestamp]
 end
 ```
 
-The language supports multiple functions, parameter passing, user function
-calls, `if`/`else`, `while`, reassignment through `let`, literals, variables,
-arrays, parenthesized expressions, boolean operators (`and`, `or`, `not`),
-comparisons (`==`, `!=`, `<`, `>`, `<=`, `>=`), arithmetic with spaced operators
-such as `a + b`, capability calls like `cap clock.now@1()`, and `print(...)`
-sugar for `cap log.print@1(...)`.
+The high-level language supports functions, parameters, calls, `if`/`else`,
+`while`, arrays, arithmetic, comparisons, boolean operators, capability calls,
+and `print(...)` sugar for `log.print@1`.
 
-```text
-fn bump(value)
-  return value + 1
-end
+## Architecture
 
-fn main
-  let i = 0
-  let total = 0
-  while i < 4
-    let total = total + bump(i)
-    let i = i + 1
-  end
+| Crate | Purpose |
+| --- | --- |
+| `chronicle-core` | bytecode model, verifier, VM runtime, capabilities, trace/replay, host SDK |
+| `chronicle-asm` | `.casm` assembly parser |
+| `chronicle-lang` | high-level `.chr` compiler |
+| `chronicle-cli` | command-line runner, debugger, audit tooling |
+| `chronicle-embed-demo` | Rust embedding example with custom host capabilities |
 
-  if total == 10
-    return "ok"
-  else
-    return "bad"
-  end
-end
-```
+## Documentation
 
-## Benchmarks
+- [Security model](docs/security.md)
+- [Trace and replay](docs/trace-replay.md)
+- [Capabilities](docs/capabilities.md)
+- [Verifier](docs/verifier.md)
+- [Benchmarks](docs/benchmarks.md)
+
+## Verification
 
 ```sh
-cargo bench -p chronicle-cli
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo bench -p chronicle-cli --no-run
 ```
 
-## Install Locally
-
-```sh
-cargo install --path crates/chronicle-cli
-```
-
-After installation, the CLI is available as `chronicle`.
-
-## Resource Limits
-
-`run` and `trace` use deterministic sandbox limits by default:
-
-- `--max-instructions 100000`
-- `--max-call-depth 64`
-- `--max-registers 1024`
-- `--max-array-items 4096`
-
-Each limit can be overridden individually:
-
-```sh
-chronicle run examples/audit-plugin.chr --policy examples/audit-policy.toml \
-  --max-instructions 10000 \
-  --max-call-depth 32 \
-  --max-registers 256 \
-  --max-array-items 1024
-```
-
-If a limit is hit during tracing, the trace records the failed event and the
-resource-limit error. Use `--unbounded` only when intentionally reproducing the
-older unlimited CLI behavior; it cannot be combined with explicit `--max-*`
-flags.
-
-## Trace Audit
-
-Traces include provenance metadata: runtime version, module digest, policy
-digest, effective limits, and negotiated grant/mock capability decisions.
-
-```sh
-chronicle audit /tmp/audit.ctrace
-chronicle audit /tmp/audit.ctrace --json
-```
-
-`audit` replays full traces to validate the checksum and reports capability
-counts, limits, digests, result, or recorded error. Trace slices are marked as
-inspection-only and are rejected by exact replay.
-
-## Trace Debugger
-
-```sh
-chronicle debug /tmp/plugin.ctrace
-```
-
-The interactive debugger supports `next`, `prev`, `back N`, `forward N`,
-`jump N`, `state`, `regs`, `caps`, `diff A B`, `slice A B`, `why`, `event`,
-`source`, `help`, and `quit`. For scripted use and tests:
-
-```sh
-chronicle debug /tmp/plugin.ctrace --commands "source;next;regs;caps;quit"
-```
-
-## Web Trace Viewer
-
-Open `tools/trace-viewer/index.html` in a browser, or serve it locally:
-
-```sh
-python3 -m http.server 4173 --directory tools/trace-viewer
-```
-
-Then visit `http://localhost:4173` and drop a `.ctrace` file into the viewer.
-The page also includes a built-in sample trace for quick demos.
-
-## Safe Plugin Demo
-
-`examples/plugin.chr` and `examples/plugin.casm` declare three capabilities. Run them with
-`plugin-mock.toml` for deterministic host values, `plugin-grant.toml` for live
-host values, or `plugin-deny.toml` to see capability negotiation fail before
-execution.
+The test suite covers verifier errors, resource limits, trace replay, host SDK
+behavior, CLI flows, malformed binary smoke cases, and property-based malformed
+input checks.
