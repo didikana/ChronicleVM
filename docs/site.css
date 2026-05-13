@@ -162,7 +162,7 @@ h2 {
   margin-bottom: 18px;
   color: var(--ink);
   font-size: clamp(2rem, 5vw, 4.25rem);
-  font-weight: 850;
+  font-weight: 800;
   line-height: 0.96;
 }
 
@@ -338,7 +338,7 @@ h3 {
   gap: 28px;
   align-items: stretch;
   width: min(1180px, calc(100vw - 32px));
-  margin: 0 auto;
+  margin: 48px auto 0;
   padding: 30px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -415,6 +415,15 @@ h3 {
 .architecture-grid p {
   color: var(--muted);
   line-height: 1.62;
+}
+
+.feature-grid p code,
+.demo-notes p code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(12, 79, 70, 0.08);
+  font-size: 0.84em;
+  color: var(--accent-dark);
 }
 
 .feature-band {
@@ -697,8 +706,20 @@ h3 {
 }
 
 .why-card code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(12, 79, 70, 0.08);
   font-size: 0.84em;
   color: var(--accent-dark);
+}
+
+.why-num {
+  display: inline-block;
+  margin-bottom: 14px;
+  color: var(--gold);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.72rem;
+  font-weight: 800;
 }
 
 /* ── pipeline / architecture ───────────────────────────────────── */
@@ -716,13 +737,13 @@ h3 {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  min-width: 138px;
+  flex: 1 1 130px;
+  min-width: 130px;
   padding: 18px 16px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
   box-shadow: var(--shadow);
-  flex-shrink: 0;
 }
 
 .pl-node--key {

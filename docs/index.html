@@ -129,7 +129,7 @@ cargo run -p chronicle-cli -- debug /tmp/audit.ctrace \
             </article>
             <article>
               <h3>Browser inspection</h3>
-              <p>The static trace viewer loads `.ctrace` files locally and exposes timelines, diffs, source maps, and raw events.</p>
+              <p>The static trace viewer loads <code>.ctrace</code> files locally and exposes timelines, diffs, source maps, and raw events.</p>
             </article>
           </div>
         </div>
@@ -149,7 +149,7 @@ cargo run -p chronicle-cli -- debug /tmp/audit.ctrace \
           <article>
             <span>02</span>
             <h3>Default sandbox limits</h3>
-            <p>CLI runs are bounded by instruction count, call depth, register count, and array size unless `--unbounded` is explicit.</p>
+            <p>CLI runs are bounded by instruction count, call depth, register count, and array size unless <code>--unbounded</code> is explicit.</p>
           </article>
           <article>
             <span>03</span>
@@ -166,6 +166,7 @@ cargo run -p chronicle-cli -- debug /tmp/audit.ctrace \
         </div>
         <div class="why-grid">
           <div class="why-card">
+            <span class="why-num">01</span>
             <h3>Why not WASM?</h3>
             <p>WebAssembly gives you portable sandboxing. ChronicleVM gives you <em>inspectable</em> sandboxing.</p>
             <ul>
@@ -177,6 +178,7 @@ cargo run -p chronicle-cli -- debug /tmp/audit.ctrace \
             </ul>
           </div>
           <div class="why-card">
+            <span class="why-num">02</span>
             <h3>Why deterministic replay?</h3>
             <p>"The plugin ran fine in CI" is not evidence when CI used live clocks and real randomness.</p>
             <ul>
